@@ -211,6 +211,10 @@ class TextDPOTrainer:
         if hasattr(self.model, "get_parallel_plan"):
             cpu_load_param_name = getattr(self.model.get_parallel_plan(), "cpu_load_param_name", None)
 
+        backend_kwargs = {}
+        fsdp_backend = getattr(args.train.accelerator.fsdp_config, "fsdp_backend", "torch")
+        if fsdp_backend != "torch":
+            backend_kwargs["fsdp_backend"] = fsdp_backend
         self.reference_model = build_parallelize_model(
             self.reference_model,
             init_device=args.train.init_device,
@@ -227,6 +231,7 @@ class TextDPOTrainer:
             broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0,
             cpu_load_param_name=cpu_load_param_name,
             max_load_broadcast_size=args.train.accelerator.fsdp_config.max_load_broadcast_size,
+            **backend_kwargs,
         )
         self.reference_model.eval()
         helper.print_device_mem_info("VRAM usage after building reference model")

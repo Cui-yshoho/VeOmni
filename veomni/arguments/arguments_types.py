@@ -220,6 +220,14 @@ class OptimizerConfig:
             )
         },
     )
+    use_hyper_optimizer: bool = field(
+        default=False,
+        metadata={"help": "Use the optional HyperParallel Muon implementation."},
+    )
+
+    def __post_init__(self):
+        if self.use_hyper_optimizer and self.type != "muon":
+            raise ValueError("use_hyper_optimizer=True requires optimizer type='muon'.")
 
 
 @dataclass
@@ -468,6 +476,10 @@ class FSDPConfig:
         },
     )
     mixed_precision: MixedPrecisionConfig = field(default_factory=MixedPrecisionConfig)
+    fsdp_backend: Literal["torch", "hyper"] = field(
+        default="torch",
+        metadata={"help": "FSDP2 implementation backend."},
+    )
 
     def __post_init__(self):
         if self.fsdp_mode not in ("ddp", "fsdp2"):
@@ -475,6 +487,10 @@ class FSDPConfig:
                 f"Unsupported fsdp_mode={self.fsdp_mode!r}. FSDP1 has been removed; "
                 "switch to fsdp_mode='fsdp2' (with train.init_device='meta') or 'ddp'."
             )
+        if self.fsdp_backend not in ("torch", "hyper"):
+            raise ValueError(f"Unsupported fsdp_backend={self.fsdp_backend!r}; expected 'torch' or 'hyper'.")
+        if self.fsdp_mode != "fsdp2" and self.fsdp_backend != "torch":
+            raise ValueError("fsdp_backend='hyper' requires fsdp_mode='fsdp2'.")
 
 
 @dataclass

@@ -8,6 +8,7 @@ from torch.distributed._tensor import DTensor
 
 from ...utils.device import get_device_type
 from ...utils.logging import get_logger
+from ..hyper_fsdp2 import is_hyper_dtensor
 from ..parallel_state import get_parallel_state
 
 
@@ -17,6 +18,29 @@ logger = get_logger(__name__)
 def clip_grad_norm(
     model, max_norm: float, norm_type: float = 2.0, error_if_nonfinite: bool = False, foreach: bool | None = None
 ) -> torch.Tensor:
+    if getattr(model, "_veomni_fsdp_backend", "torch") == "hyper":
+        from hyper_parallel import hsdp_sync_stream
+
+        hsdp_sync_stream()
+        if hasattr(model, "_extra_parallel_param_groups"):
+            return extra_parallel_fsdp2_clip_grad_norm(
+                model,
+                max_norm,
+                norm_type=norm_type,
+                error_if_nonfinite=error_if_nonfinite,
+                foreach=foreach,
+            )
+
+        from hyper_parallel.core.utils import clip_grad_norm_
+
+        return clip_grad_norm_(
+            model,
+            max_norm,
+            norm_type=norm_type,
+            error_if_nonfinite=error_if_nonfinite,
+            foreach=foreach,
+        )
+
     if hasattr(model, "_extra_parallel_param_groups"):
         return extra_parallel_fsdp2_clip_grad_norm(
             model,
@@ -216,12 +240,21 @@ def extra_parallel_fsdp2_clip_grad_norm(
     _raise_if_nonfinite(total_norm, norm_type, error_if_nonfinite)
 
     # Apply the same clip coefficient to all groups
-    for para in ps.extra_parallel_names:
-        torch.nn.utils.clip_grads_with_norm_(extra_parallel_params[para], max_norm, total_norm, foreach=foreach)
-        torch.nn.utils.clip_grads_with_norm_(
-            extra_parallel_replicated_params[para], max_norm, total_norm, foreach=foreach
-        )
-    torch.nn.utils.clip_grads_with_norm_(non_extra_parallel_params, max_norm, total_norm, foreach=foreach)
+    if getattr(model, "_veomni_fsdp_backend", "torch") == "hyper":
+        from hyper_parallel import SkipDTensorDispatch
+
+        clip_context = SkipDTensorDispatch()
+    else:
+        from contextlib import nullcontext
+
+        clip_context = nullcontext()
+    with clip_context:
+        for para in ps.extra_parallel_names:
+            torch.nn.utils.clip_grads_with_norm_(extra_parallel_params[para], max_norm, total_norm, foreach=foreach)
+            torch.nn.utils.clip_grads_with_norm_(
+                extra_parallel_replicated_params[para], max_norm, total_norm, foreach=foreach
+            )
+        torch.nn.utils.clip_grads_with_norm_(non_extra_parallel_params, max_norm, total_norm, foreach=foreach)
 
     return total_norm
 
@@ -253,7 +286,7 @@ def _local_pth_sum(params: List[torch.nn.Parameter], p: float) -> torch.Tensor:
             g = param.grad
             if g is None:
                 continue
-            if isinstance(g, DTensor):
+            if isinstance(g, DTensor) or is_hyper_dtensor(g):
                 g = g.to_local()
             g = g.detach()
             # ``dtype`` controls accumulation inside the reduction kernel. In
@@ -277,7 +310,7 @@ def _local_max(params: List[torch.nn.Parameter]) -> torch.Tensor:
         g = q.grad
         if g is None:
             continue
-        if isinstance(g, DTensor):
+        if isinstance(g, DTensor) or is_hyper_dtensor(g):
             g_local = g.to_local()
         else:
             g_local = g

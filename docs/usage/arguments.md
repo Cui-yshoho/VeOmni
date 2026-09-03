@@ -403,6 +403,7 @@ The default `mode=None` follows TorchTitan's main path by using the `inductor` b
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | type | `Literal["adamw", "anyprecision_adamw", "muon"]` | `"adamw"` | Optimizer type. `muon` builds Muon and AdamW parameter groups. |
+| use_hyper_optimizer | `bool` | `False` | Use HyperParallel's HSDP-aware Muon implementation. Requires `type: muon`, `muon_ns_implementation: std`, and `muon_adjust_lr_fn: match_rms_adamw`; HyperParallel remains optional when disabled. |
 | lr | `float` | `5e-5` | Maximum / default learning rate. |
 | lr_min | `float` | `1e-7` | Minimum learning rate. |
 | lr_start | `float` | `0.0` | Starting learning rate for warmup. |
@@ -525,6 +526,7 @@ distinct from the first emission.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | fsdp_mode | `Literal["ddp", "fsdp2"]` | `"fsdp2"` | Data parallel mode. |
+| fsdp_backend | `Literal["torch", "hyper"]` | `"torch"` | FSDP2 implementation. `"hyper"` requires HyperParallel to be installed separately. |
 | reshard_after_forward | `bool` | `True` | Reshard after forward (FSDP2). |
 | reshard_after_backward | `bool` | `True` | Reshard after backward (FSDP2). |
 | forward_prefetch | `bool` | `True` | Enable forward prefetch. |

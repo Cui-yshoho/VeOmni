@@ -560,6 +560,9 @@ class BaseTrainer(Stateful, ABC):
 
         if args.model.fqn_to_index_mapping is not None:
             kwargs["fqn_to_index_mapping"] = args.model.fqn_to_index_mapping
+        fsdp_backend = getattr(args.train.accelerator.fsdp_config, "fsdp_backend", "torch")
+        if fsdp_backend != "torch":
+            kwargs["fsdp_backend"] = fsdp_backend
 
         # A full non-LoRA resume already contains model weights. Skip the HF
         # materialization pass to avoid a second peak (HF load then checkpoint

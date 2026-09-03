@@ -230,21 +230,32 @@ def _dispatch_parameter(
     """
     full_param_name = name
     module, local_name = _find_submodule(module, name)
-    orig_tensor = module._parameters[local_name].data
+    orig_param = module._parameters[local_name]
+    orig_tensor = orig_param.data
+    distributed_tensor = orig_tensor if hasattr(orig_tensor, "device_mesh") else orig_param
+    from ..distributed.hyper_fsdp2 import is_hyper_dtensor
+
+    uses_hyper_dtensor = is_hyper_dtensor(distributed_tensor)
 
     # Handle parameter slicing according to parallel_plan, now only ExtraParallel-aware
     if parallel_plan is not None:
-        tensor = parallel_plan.shard_tensor(tensor, full_param_name, orig_tensor.shape)
+        target_shape = distributed_tensor.shape if uses_hyper_dtensor else orig_tensor.shape
+        tensor = parallel_plan.shard_tensor(tensor, full_param_name, target_shape)
 
-    if hasattr(orig_tensor, "device_mesh"):  # dtensor
+    if hasattr(distributed_tensor, "device_mesh"):  # dtensor
         if dtensor_factory is None:
             raise ValueError("dtensor parameter requires a dtensor_factory.")
-        device_mesh = orig_tensor.device_mesh
-        placements = orig_tensor.placements
+        device_mesh = distributed_tensor.device_mesh
+        placements = distributed_tensor.placements
         sharded_tensor = dtensor_factory(tensor.to(dtype=orig_tensor.dtype), device_mesh, placements)
         if dtensor_to_cpu:
             sharded_tensor = sharded_tensor.to("cpu")
-        module._parameters[local_name].data.copy_(sharded_tensor)
+        copy_source = sharded_tensor.to_local() if uses_hyper_dtensor else sharded_tensor
+        if orig_tensor.is_meta and uses_hyper_dtensor:
+            replacement = torch.nn.Parameter(sharded_tensor, requires_grad=orig_param.requires_grad)
+            torch.utils.swap_tensors(orig_param, replacement)
+        else:
+            module._parameters[local_name].data.copy_(copy_source)
     else:  # not dtensor
         tensor = tensor.to(orig_tensor)
         module._parameters[local_name].data.copy_(tensor)
@@ -357,7 +368,8 @@ def load_model_weights(
     """
     buffer_dict = {name: buffer.clone() for name, buffer in model.named_buffers()}
     parameter_names_to_load = {name for name, _ in model.named_parameters()}
-    model.to_empty(device=init_device)
+    if not kwargs.pop("skip_model_to_empty", False):
+        model.to_empty(device=init_device)
     dtensor_to_cpu = init_device == "cpu"
 
     # Get parallel plan if available -- via the runtime helper which
@@ -663,7 +675,8 @@ def load_model_weights_ep_sharded(
                     f"to use the whole-tensor loader (broadcast or every-rank-read)."
                 )
 
-    model.to_empty(device=init_device)
+    if not kwargs.pop("skip_model_to_empty", False):
+        model.to_empty(device=init_device)
     dtensor_to_cpu = init_device == "cpu"
 
     keys_by_file: Dict[str, List[str]] = {}
@@ -884,7 +897,8 @@ def rank0_load_and_broadcast_weights(
 
     buffer_dict = {name: buffer.clone() for name, buffer in model.named_buffers()}
     parameter_names_to_load = {name for name, _ in model.named_parameters()}
-    model.to_empty(device=init_device)
+    if not kwargs.pop("skip_model_to_empty", False):
+        model.to_empty(device=init_device)
     dtensor_to_cpu = init_device == "cpu"
 
     # Get parallel plan if available -- routed through the runtime helper

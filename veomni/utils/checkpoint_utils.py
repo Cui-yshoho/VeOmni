@@ -30,6 +30,7 @@ from .logging import get_logger
 logger = get_logger(__name__)
 
 _GLOBAL_STEP_PREFIX = "global_step_"
+_HYPER_COMPLETION_MARKER = ".hyper_complete"
 
 
 def should_skip_hf_weight_load(load_path: Optional[str], lora_config: Any) -> bool:
@@ -53,7 +54,8 @@ def _validate_dcp_checkpoint_entry(checkpoints_dir: str, entry: str):
         return None
 
     metadata_path = os.path.join(checkpoint_path, ".metadata")
-    if not exists(metadata_path):
+    hyper_completion_marker = os.path.join(checkpoint_path, _HYPER_COMPLETION_MARKER)
+    if not exists(metadata_path) and not exists(hyper_completion_marker):
         return None
 
     return step
