@@ -70,6 +70,7 @@ class ModelCheckpointManager:
         self.checkpointer: CheckpointerBase = build_checkpointer(
             ckpt_manager=self.config.manager,
             dist_backend=trainer.args.model.accelerator.fsdp_config.fsdp_mode,
+            fsdp_backend=getattr(trainer.args.model.accelerator.fsdp_config, "fsdp_backend", "torch"),
         )
 
     @property
