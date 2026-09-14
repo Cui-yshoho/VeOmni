@@ -230,21 +230,28 @@ def _dispatch_parameter(
     """
     full_param_name = name
     module, local_name = _find_submodule(module, name)
-    orig_tensor = module._parameters[local_name].data
+    orig_param = module._parameters[local_name]
+    orig_tensor = orig_param.data
+    distributed_tensor = orig_tensor if hasattr(orig_tensor, "device_mesh") else orig_param
+    from ..distributed.hyper_fsdp2 import is_hyper_dtensor
+
+    uses_hyper_dtensor = is_hyper_dtensor(distributed_tensor)
 
     # Handle parameter slicing according to parallel_plan, now only ExtraParallel-aware
     if parallel_plan is not None:
-        tensor = parallel_plan.shard_tensor(tensor, full_param_name, orig_tensor.shape)
+        target_shape = distributed_tensor.shape if uses_hyper_dtensor else orig_tensor.shape
+        tensor = parallel_plan.shard_tensor(tensor, full_param_name, target_shape)
 
-    if hasattr(orig_tensor, "device_mesh"):  # dtensor
+    if hasattr(distributed_tensor, "device_mesh"):  # dtensor
         if dtensor_factory is None:
             raise ValueError("dtensor parameter requires a dtensor_factory.")
-        device_mesh = orig_tensor.device_mesh
-        placements = orig_tensor.placements
+        device_mesh = distributed_tensor.device_mesh
+        placements = distributed_tensor.placements
         sharded_tensor = dtensor_factory(tensor.to(dtype=orig_tensor.dtype), device_mesh, placements)
         if dtensor_to_cpu:
             sharded_tensor = sharded_tensor.to("cpu")
-        module._parameters[local_name].data.copy_(sharded_tensor)
+        copy_source = sharded_tensor.to_local() if uses_hyper_dtensor else sharded_tensor
+        module._parameters[local_name].data.copy_(copy_source)
     else:  # not dtensor
         tensor = tensor.to(orig_tensor)
         module._parameters[local_name].data.copy_(tensor)

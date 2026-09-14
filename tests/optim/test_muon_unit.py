@@ -246,6 +246,34 @@ class TestFsdpAllToAllEligibility:
         assert submesh.ndim == 1
         assert submesh.size(0) == 8
 
+    def test_hyper_style_placements_are_eligible(self):
+        """Placement predicates let Hyper DTensors reuse the same owner path."""
+
+        class HyperShard:
+            dim = 0
+
+            @staticmethod
+            def is_shard():
+                return True
+
+        class HyperReplicate:
+            @staticmethod
+            def is_shard():
+                return False
+
+            @staticmethod
+            def is_replicate():
+                return True
+
+        mesh = _FakeMesh((2, 8), ("dp_replicate", "dp_shard_sp"))
+        param = SimpleNamespace(device_mesh=mesh, placements=(HyperReplicate(), HyperShard()))
+
+        submesh = _fsdp_all2all_submesh(param)
+
+        assert mesh.sliced_with == "dp_shard_sp"
+        assert submesh.ndim == 1
+        assert submesh.size(0) == 8
+
     def test_pending_reduction_is_not_eligible(self):
         """A Partial() dim owes a reduction, so the gather cannot be skipped."""
         mesh = _FakeMesh((2, 8), ("dp_replicate", "dp_shard_sp"))

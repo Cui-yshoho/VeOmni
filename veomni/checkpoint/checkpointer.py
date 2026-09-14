@@ -27,7 +27,11 @@ CHECKPOINTER_REGISTRY = Registry("checkpointer")
 CHECKPOINT_TO_STATE_DICT_REGISTRY = Registry("checkpoint_to_state_dict")
 
 
-def build_checkpointer(ckpt_manager: str, dist_backend: str):
+def build_checkpointer(ckpt_manager: str, dist_backend: str, fsdp_backend: str = "torch"):
+    if ckpt_manager == "dcp" and dist_backend == "fsdp2" and fsdp_backend == "hyper":
+        from .hyper_parallel_checkpointer import HyperParallelCheckpointer
+
+        return HyperParallelCheckpointer
     return CHECKPOINTER_REGISTRY[ckpt_manager](dist_backend)
 
 
