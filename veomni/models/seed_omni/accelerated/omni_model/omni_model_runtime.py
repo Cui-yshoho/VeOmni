@@ -289,6 +289,8 @@ class OmniModelRuntime:
                 ep_sharded_stream_load=args.ep_sharded_stream_load,
                 max_load_broadcast_size=acc.fsdp_config.max_load_broadcast_size,
                 muon_expert_zero_comm=muon_expert_zero_comm,
+                low_precision_reduce_scatter_comm=acc.fsdp_config.low_precision_reduce_scatter_comm,
+                fsdp_backend=acc.fsdp_config.fsdp_backend,
                 compile_config=compile_config,
                 **kwargs,
             )

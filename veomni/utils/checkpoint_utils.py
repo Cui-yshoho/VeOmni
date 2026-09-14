@@ -30,6 +30,7 @@ from .logging import get_logger
 logger = get_logger(__name__)
 
 _GLOBAL_STEP_PREFIX = "global_step_"
+_HYPER_COMPLETION_MARKER = ".hyper_complete"
 
 
 def should_skip_hf_weight_load(load_path: Optional[str], lora_config: Any) -> bool:

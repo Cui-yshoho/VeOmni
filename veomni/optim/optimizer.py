@@ -34,6 +34,14 @@ from ..utils import logging
 from .muon import DistributedMuon, infer_head_block_counts, split_muon_adamw_params
 
 
+def _is_fsdp_dtensor(param: torch.Tensor) -> bool:
+    if isinstance(param, DTensor):
+        return True
+    from ..distributed.hyper_fsdp2 import is_hyper_dtensor
+
+    return is_hyper_dtensor(param)
+
+
 if TYPE_CHECKING:
     from ..arguments import OptimizerConfig
 
@@ -80,8 +88,6 @@ def _collect_ep_replicated_lora_param_ids(model: "nn.Module") -> set[int]:
     from the same post-wrap Parameter objects in the same call, and those
     lists hold long-lived references that prevent garbage collection.
     """
-    from torch.distributed._tensor import DTensor
-
     out: set[int] = set()
     for mod in model.modules():
         # Walk the MRO so we still match after FSDP2's ``fully_shard`` rebases the
@@ -97,7 +103,7 @@ def _collect_ep_replicated_lora_param_ids(model: "nn.Module") -> set[int]:
                 # point, FSDP2 hasn't wrapped yet -- ``build_optimizer`` was
                 # invoked before ``build_parallelize_model``. The snapshot
                 # we are about to take would be stale immediately.
-                assert isinstance(p, DTensor), (
+                assert _is_fsdp_dtensor(p), (
                     f"_collect_ep_replicated_lora_param_ids: LoRA param {n!r} on a "
                     f"LoraSharedExperts wrapper is not a DTensor -- call "
                     f"build_parallelize_model before build_optimizer so FSDP2 has "
@@ -456,6 +462,117 @@ def _collect_muon_kwargs(optimizer_cfg: "OptimizerConfig") -> Dict[str, Any]:
     }
 
 
+def _build_hyper_muon_with_adamw(
+    model: "nn.Module",
+    lr: float,
+    betas: Tuple[float, float],
+    eps: float,
+    weight_decay: float,
+    fused: bool,
+    no_decay_modules: Optional[List[str]],
+    no_decay_params: Optional[List[str]],
+    muon_kwargs: Optional[Dict[str, Any]],
+):
+    """Build HyperParallel's HSDP-aware Muon while retaining VeOmni parameter grouping."""
+    muon_kwargs = dict(muon_kwargs or {})
+    expert_zero_comm = bool(muon_kwargs.pop("expert_zero_comm", False))
+    head_group_size = int(muon_kwargs.pop("head_group_size", 0) or 0)
+    head_split_modules = tuple(muon_kwargs.pop("head_split_modules", None) or ())
+    if head_group_size:
+        raise ValueError(
+            "use_hyper_optimizer=True does not yet support muon_head_group_size; "
+            "set it to 0 instead of silently changing the orthogonalization layout."
+        )
+    if head_split_modules:
+        raise ValueError(
+            "use_hyper_optimizer=True does not yet support muon_head_split_modules; "
+            "remove it instead of silently ignoring the selection."
+        )
+
+    adjust_lr_fn = muon_kwargs.get("adjust_lr_fn", "match_rms_adamw")
+    if adjust_lr_fn != "match_rms_adamw":
+        raise ValueError("use_hyper_optimizer=True currently supports only muon_adjust_lr_fn='match_rms_adamw'.")
+    ns_implementation = muon_kwargs.get("ns_implementation", "gram_quack")
+    if ns_implementation != "std":
+        raise ValueError(
+            "use_hyper_optimizer=True requires muon_ns_implementation='std'; "
+            "HyperParallel does not implement VeOmni's Gram/Quack reset schedule."
+        )
+    muon_lr = muon_kwargs.get("lr")
+    if muon_lr is None:
+        muon_lr = lr if adjust_lr_fn == "match_rms_adamw" else 25.0 * lr
+
+    muon_params, adamw_params, muon_names, adamw_names = split_muon_adamw_params(
+        model,
+        no_decay_modules=no_decay_modules,
+        no_decay_params=no_decay_params,
+    )
+    if not muon_params:
+        raise ValueError("HyperParallel Muon was selected but the model has no eligible 2D/3D parameters.")
+
+    muon_param_groups = [{"params": muon_params}]
+    adamw_param_groups = _make_param_groups_for_subset(
+        model, adamw_params, weight_decay, no_decay_modules, no_decay_params
+    )
+    ns_steps = int(muon_kwargs.get("ns_steps", 5))
+    ns_coefficients = tuple(float(value) for value in muon_kwargs.get("ns_coefficients", (3.4445, -4.775, 2.0315)))
+    if len(ns_coefficients) != 3:
+        raise ValueError("HyperParallel Muon requires exactly three muon_ns_coefficients values.")
+    try:
+        from hyper_parallel.core.optimizer import get_hyper_optimizer
+    except ImportError as exc:
+        raise RuntimeError(
+            "use_hyper_optimizer=True requires the optional 'hyper_parallel' package. "
+            "Install HyperParallel in the active training environment first."
+        ) from exc
+    optimizer = get_hyper_optimizer(
+        model=model,
+        muon_params=muon_param_groups,
+        adamw_params=adamw_param_groups,
+        muon_kwargs={
+            "muon_lr": float(muon_lr),
+            "muon_weight_decay": float(muon_kwargs.get("weight_decay", 0.0)),
+            "muon_momentum": muon_kwargs.get("momentum", 0.95),
+            "muon_nesterov": muon_kwargs.get("nesterov", True),
+            "muon_ns_steps": ns_steps,
+            "muon_ns_variant": "custom",
+            "muon_ns_coefficients": [ns_coefficients] * ns_steps,
+            "muon_ns_epsilon": float(muon_kwargs.get("eps", 1e-7)),
+        },
+        adamw_kwargs={
+            "adamw_lr": float(lr),
+            "adamw_weight_decay": float(weight_decay),
+            "adamw_betas": betas,
+            "adamw_eps": eps,
+            "fused": fused,
+        },
+    )
+    from ..distributed.hyper_fsdp2 import wrap_optimizer
+
+    wrap_optimizer(optimizer)
+
+    if _should_build_extra_parallel_aware(model):
+        parallel_state = get_parallel_state()
+        extra_names = list(parallel_state.extra_parallel_names)
+        model._extra_parallel_param_groups = {name: [] for name in extra_names}
+        model._extra_parallel_param_groups["non_extra_parallel"] = []
+        for param in (*muon_params, *adamw_params):
+            para = _is_extra_parallel_param(param, extra_names)
+            key = para if para is not None else "non_extra_parallel"
+            model._extra_parallel_param_groups[key].append(param)
+
+    logger.info_rank0(
+        "HyperParallel Muon optimizer: %d Muon params, %d AdamW params; first Muon=%s, first AdamW=%s; "
+        "expert_zero_comm=%s.",
+        len(muon_params),
+        len(adamw_params),
+        muon_names[:3],
+        adamw_names[:3],
+        expert_zero_comm,
+    )
+    return optimizer
+
+
 def build_optimizer(
     model: "nn.Module",
     lr: float = 1e-3,
@@ -469,6 +586,7 @@ def build_optimizer(
     no_decay_params: Optional[List[str]] = None,
     muon_kwargs: Optional[Dict[str, Any]] = None,
     optimizer_config: Optional["OptimizerConfig"] = None,
+    use_hyper_optimizer: bool = False,
 ) -> "torch.optim.Optimizer":
     """Build the optimizer.
 
@@ -483,6 +601,7 @@ def build_optimizer(
     if optimizer_type == "muon":
         if optimizer_config is not None:
             muon_kwargs = {**_collect_muon_kwargs(optimizer_config), **(muon_kwargs or {})}
+            use_hyper_optimizer = bool(optimizer_config.use_hyper_optimizer) or use_hyper_optimizer
         if param_groups is not None:
             logger.warning_rank0(
                 "build_optimizer(optimizer_type='muon') ignores the provided "
@@ -490,7 +609,19 @@ def build_optimizer(
                 "split_muon_adamw_params. To control vit vs. backbone learning "
                 "rates with Muon, file a follow-up or use AdamW for now."
             )
-        return _build_muon_with_adamw(
+        if use_hyper_optimizer:
+            return _build_hyper_muon_with_adamw(
+                model,
+                lr=lr,
+                betas=betas,
+                eps=eps,
+                weight_decay=weight_decay,
+                fused=fused,
+                no_decay_modules=no_decay_modules,
+                no_decay_params=no_decay_params,
+                muon_kwargs=muon_kwargs,
+            )
+        optimizer = _build_muon_with_adamw(
             model,
             lr=lr,
             betas=betas,
@@ -501,6 +632,14 @@ def build_optimizer(
             no_decay_params=no_decay_params,
             muon_kwargs=muon_kwargs,
         )
+        if getattr(model, "_veomni_fsdp_backend", "torch") == "hyper":
+            from ..distributed.hyper_fsdp2 import wrap_optimizer
+
+            wrap_optimizer(optimizer)
+        return optimizer
+
+    if use_hyper_optimizer or (optimizer_config is not None and optimizer_config.use_hyper_optimizer):
+        raise ValueError("use_hyper_optimizer=True requires optimizer_type='muon'.")
 
     if param_groups is not None:
         param_groups = filter_empty_param_groups(param_groups)
@@ -508,9 +647,14 @@ def build_optimizer(
             raise ValueError("All optimizer param groups are empty; no trainable parameters to optimize.")
 
     if _should_build_extra_parallel_aware(model):
-        return build_extra_parallel_fsdp2_optimizer(
+        optimizer = build_extra_parallel_fsdp2_optimizer(
             model, lr, betas, eps, weight_decay, fused, optimizer_type, param_groups, no_decay_modules, no_decay_params
         )
+        if getattr(model, "_veomni_fsdp_backend", "torch") == "hyper":
+            from ..distributed.hyper_fsdp2 import wrap_optimizer
+
+            wrap_optimizer(optimizer)
+        return optimizer
     if param_groups is None:
         decay_param_names = get_parameter_names(model, no_decay_modules, no_decay_params)
         param_groups = [
@@ -548,12 +692,16 @@ def build_optimizer(
             f"got optimizer_type={optimizer_type!r}."
         )
 
+    if getattr(model, "_veomni_fsdp_backend", "torch") == "hyper":
+        from ..distributed.hyper_fsdp2 import wrap_optimizer
+
+        wrap_optimizer(optim)
     return optim
 
 
 def _is_extra_parallel_param(p: torch.nn.Parameter, extra_parallel_names: Sequence[str]) -> Optional[str]:
     """Return the ExtraParallel name for a DTensor param, or ``None``."""
-    if DTensor is None or not isinstance(p, DTensor):
+    if not _is_fsdp_dtensor(p):
         return None
     mesh = getattr(p, "device_mesh", None)
     names = getattr(mesh, "mesh_dim_names", []) if mesh is not None else []
@@ -830,7 +978,7 @@ def build_extra_parallel_fsdp2_optimizer(
 
                 # Check if this parameter is part of ExtraParallel
                 is_extra_parallel_params = False
-                if DTensor is not None and isinstance(p, DTensor):
+                if _is_fsdp_dtensor(p):
                     mesh = getattr(p, "device_mesh", None)
                     names = getattr(mesh, "mesh_dim_names", []) if mesh is not None else []
                     for para in parallel_state.extra_parallel_names:
@@ -881,7 +1029,7 @@ def build_extra_parallel_fsdp2_optimizer(
 
             # Check if this parameter is part of ExtraParallel
             is_extra_parallel_params = False
-            if DTensor is not None and isinstance(p, DTensor):
+            if _is_fsdp_dtensor(p):
                 mesh = getattr(p, "device_mesh", None)
                 names = getattr(mesh, "mesh_dim_names", []) if mesh is not None else []
                 logger.debug_rank0(f"param {name} has device_mesh {mesh} with mesh dim names {names}")

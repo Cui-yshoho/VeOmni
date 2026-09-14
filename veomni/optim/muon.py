@@ -685,14 +685,54 @@ _KIND_MOE_LOCAL_3D = "moe_local_3d"
 _KIND_MOE_GATHER_3D = "moe_gather_3d"
 
 
-def _shard_dims(p: DTensor) -> List[int]:
+def _is_hyper_dtensor_like(tensor: Tensor) -> bool:
+    """Return whether ``tensor`` is an explicitly registered Hyper DTensor."""
+    from ..distributed.hyper_fsdp2 import is_hyper_dtensor
+
+    return is_hyper_dtensor(tensor)
+
+
+def _is_shard_placement(placement: Any) -> bool:
+    """Recognize both Torch and HyperParallel shard placements."""
+    if isinstance(placement, Shard):
+        return True
+    is_shard = getattr(placement, "is_shard", None)
+    return bool(is_shard()) if callable(is_shard) else False
+
+
+def _shard_dims(p: Tensor) -> List[int]:
     """Return the list of tensor dims along which ``p`` is sharded."""
-    return [pl.dim for pl in p.placements if isinstance(pl, Shard)]
+    return [placement.dim for placement in p.placements if _is_shard_placement(placement)]
+
+
+def _is_replicate_placement(placement: Any) -> bool:
+    """Recognize both Torch and HyperParallel replicate placements."""
+    if isinstance(placement, Replicate):
+        return True
+    is_replicate = getattr(placement, "is_replicate", None)
+    return bool(is_replicate()) if callable(is_replicate) else False
+
+
+def _owner_path_update(update: Tensor, ref: Tensor) -> Optional[Tensor]:
+    """Attach DTensor layout to a local update for the owner all-to-all path."""
+    if isinstance(update, DTensor) or _is_hyper_dtensor_like(update):
+        return update
+    if not _is_hyper_dtensor_like(ref):
+        return None
+
+    from hyper_parallel.core.dtensor.dtensor import DTensor as HyperDTensor
+
+    return HyperDTensor.from_local(
+        update,
+        device_mesh=ref.device_mesh,
+        placements=ref.placements,
+        shape=tuple(ref.shape),
+    )
 
 
 def _classify_param(p: Tensor) -> str:
     """Return one of ``_KIND_*`` describing how Muon should treat ``p``."""
-    if not isinstance(p, DTensor):
+    if not isinstance(p, DTensor) and not _is_hyper_dtensor_like(p):
         return _KIND_LOCAL
 
     shard_dims = _shard_dims(p)
@@ -713,26 +753,40 @@ def _classify_param(p: Tensor) -> str:
     )
 
 
-def _full_grad(grad: Tensor) -> Tensor:
+def _full_grad(grad: Tensor, ref: Optional[Tensor] = None) -> Tensor:
     """Return a replicated tensor, all-gathering DTensor gradients if needed."""
     if isinstance(grad, DTensor):
         return grad.full_tensor()
+    if ref is not None and _is_hyper_dtensor_like(ref):
+        from hyper_parallel.core.dtensor.dtensor import DTensor as HyperDTensor
+
+        return HyperDTensor.from_local(grad, device_mesh=ref.device_mesh, placements=ref.placements).full_tensor()
     return grad
 
 
 def _wrap_full_as_dtensor_like(full: Tensor, ref: Tensor) -> Tensor:
     """Wrap ``full`` as a DTensor with ``ref``'s placements."""
-    if not isinstance(ref, DTensor):
-        return full
+    if isinstance(ref, DTensor):
+        mesh = ref.device_mesh
+        replicated = DTensor.from_local(
+            full,
+            device_mesh=mesh,
+            placements=[Replicate()] * mesh.ndim,
+            run_check=False,
+        )
+        return replicated.redistribute(device_mesh=mesh, placements=ref.placements)
+    if _is_hyper_dtensor_like(ref):
+        from hyper_parallel.core.dtensor.dtensor import DTensor as HyperDTensor
+        from hyper_parallel.core.dtensor.placement_types import Replicate as HyperReplicate
 
-    mesh = ref.device_mesh
-    replicated = DTensor.from_local(
-        full,
-        device_mesh=mesh,
-        placements=[Replicate()] * mesh.ndim,
-        run_check=False,
-    )
-    return replicated.redistribute(device_mesh=mesh, placements=ref.placements)
+        mesh = ref.device_mesh
+        replicated = HyperDTensor.from_local(
+            full,
+            device_mesh=mesh,
+            placements=[HyperReplicate()] * mesh.ndim,
+        )
+        return replicated.redistribute(device_mesh=mesh, placements=ref.placements).to_local()
+    return full
 
 
 @lru_cache(maxsize=None)
@@ -743,7 +797,7 @@ def _shard_submesh(mesh: Any, placements: Tuple[Any, ...]) -> Optional[Any]:
     placement tuple, both fixed for the run, so the answer is cached instead of
     recomputed for every Muon parameter on every step.
     """
-    shard_dims = [i for i, pl in enumerate(placements) if isinstance(pl, Shard)]
+    shard_dims = [i for i, placement in enumerate(placements) if _is_shard_placement(placement)]
     if len(shard_dims) != 1:
         return None
     mesh_dim = shard_dims[0]
@@ -751,7 +805,7 @@ def _shard_submesh(mesh: Any, placements: Tuple[Any, ...]) -> Optional[Any]:
         return None
     # Only replicas may sit on the remaining dims. A Partial() there carries a
     # pending reduction, which skipping the collective would silently drop.
-    if any(i != mesh_dim and not isinstance(pl, Replicate) for i, pl in enumerate(placements)):
+    if any(i != mesh_dim and not _is_replicate_placement(pl) for i, pl in enumerate(placements)):
         return None
 
     if mesh.size(mesh_dim) <= 1:
@@ -768,7 +822,7 @@ def _shard_submesh(mesh: Any, placements: Tuple[Any, ...]) -> Optional[Any]:
     return mesh[dim_names[mesh_dim]]
 
 
-def _fsdp_all2all_submesh(p: DTensor) -> Optional[Any]:
+def _fsdp_all2all_submesh(p: Tensor) -> Optional[Any]:
     """Return the 1D mesh the owner-based all-to-all path should run on.
 
     ``p`` qualifies when it carries exactly one ``Shard(0)`` placement -- the
@@ -789,7 +843,7 @@ def _fsdp_all2all_submesh(p: DTensor) -> Optional[Any]:
     return _shard_submesh(p.device_mesh, tuple(p.placements))
 
 
-def _fsdp_all2all_bucket_key(update: DTensor, mesh: Any) -> Tuple[Any, torch.dtype]:
+def _fsdp_all2all_bucket_key(update: Tensor, mesh: Any) -> Tuple[Any, torch.dtype]:
     """Group all-to-all updates by shard submesh and local communication dtype."""
     return mesh, update.to_local().dtype
 
@@ -979,15 +1033,12 @@ class DistributedMuon(Optimizer):
                 update = grad.lerp(buf, momentum) if nesterov else buf
 
                 kind = _classify_param(p)
-                submesh = (
-                    _fsdp_all2all_submesh(update)
-                    if kind == _KIND_FSDP_GATHER_2D and isinstance(update, DTensor)
-                    else None
-                )
+                owner_update = _owner_path_update(update, p) if kind == _KIND_FSDP_GATHER_2D else None
+                submesh = _fsdp_all2all_submesh(owner_update) if owner_update is not None else None
                 if submesh is not None:
-                    key = _fsdp_all2all_bucket_key(update, submesh)
+                    key = _fsdp_all2all_bucket_key(owner_update, submesh)
                     entries = a2a_buckets.setdefault(key, [])
-                    entries.append((p, update))
+                    entries.append((p, owner_update))
                     if len(entries) == submesh.size(0):
                         self._flush_fsdp_all2all_chunk(
                             entries,
@@ -998,7 +1049,7 @@ class DistributedMuon(Optimizer):
                             adjust_lr_fn=adjust_lr_fn,
                         )
                 else:
-                    ortho = self._compute_ortho(update, kind, **ns_kwargs)
+                    ortho = self._compute_ortho(update, kind, ref=p, **ns_kwargs)
                     self._apply_ortho(
                         p,
                         ortho,
@@ -1083,6 +1134,8 @@ class DistributedMuon(Optimizer):
                 update_dt = ortho.to(dtype=target_dtype)
             else:
                 update_dt = _wrap_full_as_dtensor_like(ortho.to(dtype=target_dtype), p)
+        elif _is_hyper_dtensor_like(p):
+            update_dt = ortho.to(dtype=p.to_local().dtype)
         else:
             update_dt = ortho.to(dtype=p.dtype)
 
@@ -1197,6 +1250,7 @@ class DistributedMuon(Optimizer):
         ns_coefficients: Tuple[float, float, float],
         ns_steps: int,
         eps: float,
+        ref: Optional[Tensor] = None,
         ns_implementation: str = "gram_quack",
         gram_ns_reset_iterations: Sequence[int] = (2,),
         head_blocks: int = 1,
@@ -1219,9 +1273,12 @@ class DistributedMuon(Optimizer):
             return _ns(update)
 
         if kind == _KIND_FSDP_GATHER_2D:
-            return _ns(_full_grad(update))
+            ortho = _ns(_full_grad(update, ref))
+            return _wrap_full_as_dtensor_like(ortho, ref) if ref is not None and _is_hyper_dtensor_like(ref) else ortho
 
         if kind == _KIND_MOE_LOCAL_3D:
+            if ref is not None and _is_hyper_dtensor_like(ref):
+                return _ns(update)
             assert isinstance(update, DTensor)
             local = update._local_tensor
             local_ortho = _ns(local)
@@ -1233,6 +1290,7 @@ class DistributedMuon(Optimizer):
             )
 
         if kind == _KIND_MOE_GATHER_3D:
-            return _ns(_full_grad(update))
+            ortho = _ns(_full_grad(update, ref))
+            return _wrap_full_as_dtensor_like(ortho, ref) if ref is not None and _is_hyper_dtensor_like(ref) else ortho
 
         raise ValueError(f"Unknown DistributedMuon kind: {kind!r}")

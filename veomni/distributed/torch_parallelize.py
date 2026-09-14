@@ -16,7 +16,7 @@
 import types
 from collections.abc import Collection, Mapping
 from functools import partial
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -121,6 +121,7 @@ def _materialize_and_load_weights(
     module_skip_hf_weight_load: Optional[Mapping[str, bool]] = None,
     module_is_peft_model: Optional[Mapping[str, bool]] = None,
     module_adapter_path: Optional[Mapping[str, Optional[str]]] = None,
+    dtensor_factory=None,
 ) -> None:
     """Move meta-initialized parameters onto a real device and fill them in.
 
@@ -157,6 +158,7 @@ def _materialize_and_load_weights(
                 max_load_broadcast_size=max_load_broadcast_size,
                 fqn_to_index_mapping=fqn_to_index_mapping,
                 ep_sharded_stream_load=ep_sharded_stream_load,
+                dtensor_factory=dtensor_factory,
             )
         leftover_meta = [
             name
@@ -194,7 +196,10 @@ def _materialize_and_load_weights(
             model.init_weights()
         return
 
-    from torch.distributed.tensor import distribute_tensor
+    if dtensor_factory is None:
+        from torch.distributed.tensor import distribute_tensor
+
+        dtensor_factory = distribute_tensor
 
     logger.info_rank0(f"starting to load model weights from {weights_path}...")
     if is_peft_model:
@@ -209,7 +214,7 @@ def _materialize_and_load_weights(
             model,
             weights_path,
             materialize_device,
-            dtensor_factory=distribute_tensor,
+            dtensor_factory=dtensor_factory,
             cpu_load_param_name=cpu_load_param_name,
             max_load_broadcast_size=max_load_broadcast_size,
             is_peft_model=is_peft_model,
@@ -217,7 +222,7 @@ def _materialize_and_load_weights(
             fqn_to_index_mapping=fqn_to_index_mapping,
         )
     else:
-        _dt_local_split = partial(distribute_tensor, src_data_rank=None)
+        _dt_local_split = partial(dtensor_factory, src_data_rank=None)
         if ep_sharded_stream_load and _has_extra_parallel_plan(model):
             # Opt-in fast/low-memory path for large MoE checkpoints: each rank
             # reads only its ExtraParallel dim-0 slice of the expert tensors
@@ -402,6 +407,20 @@ def _configure_fsdp_gradient_reduction(
         module.set_gradient_divide_factor(gradient_divide_factor)
 
 
+def _build_root_fsdp_kwargs(fsdp_kwargs: Dict[str, Any], use_hyper_fsdp2: bool) -> Dict[str, Any]:
+    """Resolve the backend-specific root no-reshard policy.
+
+    PyTorch FSDP2 applies its root auto-no-reshard behavior only when
+    ``reshard_after_forward`` is omitted. HyperParallel has no equivalent
+    root special case and defaults an omitted value to ``True``, so pass the
+    effective PyTorch root policy explicitly on the Hyper path.
+    """
+    root_fsdp_kwargs = {k: v for k, v in fsdp_kwargs.items() if k != "reshard_after_forward"}
+    if use_hyper_fsdp2:
+        root_fsdp_kwargs["reshard_after_forward"] = False
+    return root_fsdp_kwargs
+
+
 def parallelize_model_fsdp2(
     model: "nn.Module",
     weights_path: Optional[str | Mapping[str, str]] = None,
@@ -412,6 +431,7 @@ def parallelize_model_fsdp2(
     low_precision_reduce_scatter_comm: bool = False,
     compile_config: Optional[CompileConfig] = None,
     should_skip_hf_weight_load: bool = False,
+    fsdp_backend: str = "torch",
     **kwargs,
 ) -> "nn.Module":
     """
@@ -437,17 +457,51 @@ def parallelize_model_fsdp2(
         ep_size, emb_size = 2, 4
     We will use this model for illustration of Expert Parallel + Embed Parallel below.
     """
+    if fsdp_backend not in ("torch", "hyper"):
+        raise ValueError(f"Unsupported fsdp_backend={fsdp_backend!r}; expected 'torch' or 'hyper'.")
+
     parallel_state = get_parallel_state()
+    use_hyper_fsdp2 = fsdp_backend == "hyper"
+    if use_hyper_fsdp2:
+        from .hyper_fsdp2 import (
+            extra_parallel_gradient_scaling_factor,
+            get_hyper_fsdp2_api,
+            to_hyper_device_mesh,
+        )
+
+        hyper_api = get_hyper_fsdp2_api()
+        model._veomni_fsdp_backend = "hyper"
+        fully_shard_impl = hyper_api["fully_shard"]
+        fsdp_module_type = hyper_api["module_type"]
+        mixed_precision_policy_type = hyper_api["mixed_precision_policy"]
+        cpu_offload_policy_type = hyper_api["cpu_offload_policy"]
+        shard_type = hyper_api["shard"]
+
+        def apply_fully_shard(module, fsdp_options):
+            fully_shard_impl(module, **fsdp_options)
+
+        fsdp_mesh = to_hyper_device_mesh(parallel_state.fsdp_mesh, "fsdp")
+    else:
+        fsdp_module_type = FSDPModule
+        mixed_precision_policy_type = MixedPrecisionPolicy
+        cpu_offload_policy_type = CPUOffloadPolicy
+        shard_type = Shard
+
+        def apply_fully_shard(module, fsdp_options):
+            fully_shard(module, **fsdp_options)
+
+        fsdp_mesh = parallel_state.fsdp_mesh
 
     use_low_precision_transport = validate_low_precision_reduce_scatter_comm(
         low_precision_reduce_scatter_comm, mixed_precision
     )
+    if use_hyper_fsdp2 and use_low_precision_transport:
+        raise NotImplementedError("Low-precision ReduceScatter transport is not supported by Hyper FSDP2.")
     if use_low_precision_transport:
         if get_device_type() != "cuda":
             raise RuntimeError("Low-precision ReduceScatter transport is only supported on CUDA/NCCL.")
     elif low_precision_reduce_scatter_comm:
-        logger.info_rank0("Parameter dtype matches reduce dtype; using the native PyTorch collective.")
-
+        logger.info_rank0("Parameter dtype matches reduce dtype; using the native backend collective.")
     model_no_split_modules = getattr(model, "_no_split_modules", None) or []
     target_classes = set(model_no_split_modules) | set(basic_modules or [])
 
@@ -611,10 +665,19 @@ def parallelize_model_fsdp2(
         model._veomni_compile_uses_cuda_graphs = compile_config.uses_cuda_graphs()
 
     # Step 2: Update fsdp2 kwargs
+    if use_hyper_fsdp2:
+
+        def shard_placement_fn(param):
+            shard_dim = getattr(param, "_veomni_fsdp_shard_dim", None)
+            return shard_type(shard_dim) if shard_dim is not None else None
+
+    else:
+        shard_placement_fn = _veomni_shard_placement_fn
+
     fsdp_kwargs = {
-        "mesh": parallel_state.fsdp_mesh,
+        "mesh": fsdp_mesh,
         "reshard_after_forward": enable_reshard_after_forward,
-        "shard_placement_fn": _veomni_shard_placement_fn,
+        "shard_placement_fn": shard_placement_fn,
     }
     if persistent_extra_parallel_params:
         # These params already carry their complete 2D DTensor placement. Every
@@ -623,7 +686,7 @@ def parallelize_model_fsdp2(
         fsdp_kwargs["ignored_params"] = persistent_extra_parallel_params
     # prepare mp_policy kwargs
     if mixed_precision.enable:
-        mp_policy = MixedPrecisionPolicy(
+        mp_policy = mixed_precision_policy_type(
             param_dtype=getattr(torch, mixed_precision.param_dtype) if mixed_precision.param_dtype else None,
             reduce_dtype=getattr(torch, mixed_precision.reduce_dtype) if mixed_precision.reduce_dtype else None,
             output_dtype=getattr(torch, mixed_precision.output_dtype) if mixed_precision.output_dtype else None,
@@ -649,7 +712,7 @@ def parallelize_model_fsdp2(
         # the cgroup during load. ``fsdp_offload_pin_memory=False`` keeps the
         # shards in ordinary pageable anon memory (what a bespoke manual offload
         # does) at the cost of a non-pinned (slightly slower) H2D per layer.
-        fsdp_kwargs["offload_policy"] = CPUOffloadPolicy(pin_memory=offload_pin_memory)
+        fsdp_kwargs["offload_policy"] = cpu_offload_policy_type(pin_memory=offload_pin_memory)
 
     if hasattr(model, "get_ignore_modules_in_mixed_precision"):
         modules_to_ignore_in_mixed_precision = model.get_ignore_modules_in_mixed_precision()
@@ -681,7 +744,9 @@ def parallelize_model_fsdp2(
             # - (ep_replicate, ep_fsdp, ep) -> (ep_replicate, ep_fsdp)
             para_fsdp_mesh = para_mesh[para_mesh_dim_names[:-1]]
             para_fsdp_kwargs = dict(fsdp_kwargs)
-            para_fsdp_kwargs["mesh"] = para_fsdp_mesh
+            para_fsdp_kwargs["mesh"] = (
+                to_hyper_device_mesh(para_fsdp_mesh, f"{para}_fsdp") if use_hyper_fsdp2 else para_fsdp_mesh
+            )
             shard_dim_for_para = 1
             # Muon zero-comm needs whole experts per rank; otherwise keep the
             # default hidden-dim sharding. A para this model's plan does not
@@ -701,7 +766,7 @@ def parallelize_model_fsdp2(
                         f"[muon_expert_zero_comm] {para}: falling back to the default "
                         "Shard(1) layout (Muon will use the all-to-all-gather path)."
                     )
-            para_fsdp_kwargs["shard_placement_fn"] = lambda param, _d=shard_dim_for_para: Shard(_d)
+            para_fsdp_kwargs["shard_placement_fn"] = lambda param, _d=shard_dim_for_para: shard_type(_d)
             extra_parallel_fsdp_kwargs[para] = para_fsdp_kwargs
             # Record the FSDP shard dim on the spec_info so the checkpointer can
             # build correct DTensor placements (EP dim vs FSDP dim) on save/load.
@@ -760,7 +825,7 @@ def parallelize_model_fsdp2(
             if not parallel_state.extra_parallel_enabled(para):
                 continue
             for _para_mod in extra_parallel_mod[para]:
-                if isinstance(_para_mod, FSDPModule):
+                if isinstance(_para_mod, fsdp_module_type):
                     continue
                 if any(param in persistent_extra_parallel_params for param in _para_mod.parameters()):
                     # Persistent params remain on the complete 2D mesh. Any
@@ -768,14 +833,18 @@ def parallelize_model_fsdp2(
                     # decoder/root FSDP group through the normal bottom-up walk.
                     continue
                 # shard para module (e.g. expert/decoder.moe, embed_tokens/decoder.embed_tokens)
-                fully_shard(_para_mod, **extra_parallel_fsdp_kwargs[para])
+                apply_fully_shard(_para_mod, extra_parallel_fsdp_kwargs[para])
                 # average para (e.g. ep) grads across para (e.g. ep) ranks
                 # NOTE: in torch 2.8 and later we should use
                 # experts_mod.set_gradient_divide_factor(parallel_state.ep_size)
                 # but for torch 2.7 we still use set_reduce_scatter_divide_factor(parallel_state.ep_size)
                 gradient_divide_factor = parallel_state.extra_parallel_gradient_divide_factor(para)
                 logger.info(f"setting grad divide factor for {para} module to {gradient_divide_factor}")
-                if IS_NPU_AVAILABLE:
+                if use_hyper_fsdp2:
+                    para_mesh = extra_parallel_fsdp_kwargs[para]["mesh"]
+                    scale_factor = extra_parallel_gradient_scaling_factor(para_mesh.size(), gradient_divide_factor)
+                    _para_mod.set_gradient_scaling_factor(scale_factor)
+                elif IS_NPU_AVAILABLE:
                     # NPU is using torch 2.7
                     _para_mod.set_reduce_scatter_divide_factor(gradient_divide_factor)
                 elif transport_reduction_scales is None:
@@ -793,7 +862,7 @@ def parallelize_model_fsdp2(
         if mp_ignored_classes:
             for sub_mod in layer_mod.modules():
                 if isinstance(sub_mod, mp_ignored_classes) and sub_mod is not layer_mod:
-                    fully_shard(sub_mod, **fsdp_kwargs_without_mp)
+                    apply_fully_shard(sub_mod, fsdp_kwargs_without_mp)
                     # Keep these modules off transport_reduction_scales: their genuine FP32
                     # gradients need native FP32 communication, not a lossy wire cast.
                     layer_mod._fsdp_modules.append(sub_mod)
@@ -804,15 +873,17 @@ def parallelize_model_fsdp2(
         #      when layer_mod (also called as target module, e.g. decoder.embed_tokens),
         #      is the parent of or equal to extra_parallel_mod[para] (e.g. ToyEmbed),
         #      no need to shard layer_mod again.
-        if not isinstance(layer_mod, FSDPModule):
-            fully_shard(layer_mod, **fsdp_kwargs)
+        if not isinstance(layer_mod, fsdp_module_type):
+            apply_fully_shard(layer_mod, fsdp_kwargs)
             if transport_reduction_scales is not None and fsdp_transport_enabled:
                 transport_reduction_scales[layer_mod] = fsdp_reduction_scale
             layer_mod._fsdp_modules.append(layer_mod)
         logger.info_rank0(f"{layer_fqn=}, {layer_mod._fsdp_modules=}")
 
-    # Shard root WITHOUT explicit `reshard_after_forward` so FSDP2's
-    # auto-no-reshard for the root kicks in (`_fsdp_state.py:_lazy_init`).
+    # Keep the root unsharded between forward and backward. PyTorch requires
+    # omitting `reshard_after_forward` to trigger its root auto-no-reshard
+    # behavior (`_fsdp_state.py:_lazy_init`), while Hyper requires an explicit
+    # False because its omitted-value default is True.
     # This keeps the root's params (lm_head + embeddings + final norm)
     # unsharded between forward and backward, which is what fused-linear
     # kernels (chunk_logprobs / chunk_topk_distill) need — they save the
@@ -820,8 +891,8 @@ def parallelize_model_fsdp2(
     # `setStorage … storage of size 0` when the saved reference points
     # to a freed buffer. Decoder layers reshard normally (their calls
     # above pass `reshard_after_forward` explicitly).
-    root_fsdp_kwargs = {k: v for k, v in fsdp_kwargs.items() if k != "reshard_after_forward"}
-    fully_shard(model, **root_fsdp_kwargs)
+    root_fsdp_kwargs = _build_root_fsdp_kwargs(fsdp_kwargs, use_hyper_fsdp2)
+    apply_fully_shard(model, root_fsdp_kwargs)
     # Persistent ExtraParallel parameters are ignored by every FSDP group and
     # retain their original 2D DTensor identity. Record them after wrapping so
     # gradient clipping can reduce their unique local shards once over the
@@ -844,7 +915,7 @@ def parallelize_model_fsdp2(
 
     # configure manual prefetching when needed
     need_manual_prefetch = (
-        parallel_state.any_extra_parallel_enabled or mp_ignored_classes is not None
+        use_hyper_fsdp2 or parallel_state.any_extra_parallel_enabled or mp_ignored_classes is not None
     ) and kwargs.pop("enable_forward_prefetch", True)
     if need_manual_prefetch:
         blocks = [pair[1][0] for pair in layer_pairs_list]  # all target modules
@@ -867,6 +938,11 @@ def parallelize_model_fsdp2(
     assert kwargs.get("init_device") == "meta", "Please use init_device: meta for FSDP2"
     materialize_device = "cpu" if enable_fsdp_cpu_offload else get_device_type()
 
+    backend_load_kwargs = {}
+    if use_hyper_fsdp2:
+        backend_load_kwargs = {
+            "dtensor_factory": hyper_api["distribute_tensor"],
+        }
     _materialize_and_load_weights(
         model,
         weights_path,
@@ -882,8 +958,8 @@ def parallelize_model_fsdp2(
         module_skip_hf_weight_load=kwargs.pop("module_skip_hf_weight_load", None),
         module_is_peft_model=kwargs.pop("module_is_peft_model", None),
         module_adapter_path=kwargs.pop("module_adapter_path", None),
+        **backend_load_kwargs,
     )
-
     if materialize_device == "cpu":
         _move_buffers_to_device(model, get_device_type())
 
@@ -984,6 +1060,7 @@ def build_parallelize_model(
     low_precision_reduce_scatter_comm: bool = False,
     compile_config: Optional[CompileConfig] = None,
     should_skip_hf_weight_load: bool = False,
+    fsdp_backend: str = "torch",
     **kwargs,
 ) -> "nn.Module":
     """Apply parallel strategies to the model.
@@ -1040,6 +1117,7 @@ def build_parallelize_model(
     if parallel_state.fsdp_enabled:
         logger.info_rank0(f"Apply data parallel to the model: {parallel_state.dp_mode}.")
         if parallel_state.dp_mode == "fsdp2":
+            backend_kwargs = {"fsdp_backend": fsdp_backend} if fsdp_backend != "torch" else {}
             model = parallelize_model_fsdp2(
                 model=model,
                 weights_path=weights_path,
@@ -1050,6 +1128,7 @@ def build_parallelize_model(
                 low_precision_reduce_scatter_comm=low_precision_reduce_scatter_comm,
                 compile_config=compile_config,
                 should_skip_hf_weight_load=should_skip_hf_weight_load,
+                **backend_kwargs,
                 **kwargs,
             )
         else:

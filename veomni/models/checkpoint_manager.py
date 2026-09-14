@@ -88,6 +88,7 @@ class ModelCheckpointManager:
         self.checkpointer: CheckpointerBase = build_checkpointer(
             ckpt_manager=self.config.manager,
             dist_backend=runtime.args.accelerator.fsdp_config.fsdp_mode,
+            fsdp_backend=runtime.args.accelerator.fsdp_config.fsdp_backend,
         )
 
     @property

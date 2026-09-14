@@ -246,6 +246,34 @@ class TestFsdpAllToAllEligibility:
         assert submesh.ndim == 1
         assert submesh.size(0) == 8
 
+    def test_hyper_style_placements_are_eligible(self):
+        """Placement predicates let Hyper DTensors reuse the same owner path."""
+
+        class HyperShard:
+            dim = 0
+
+            @staticmethod
+            def is_shard():
+                return True
+
+        class HyperReplicate:
+            @staticmethod
+            def is_shard():
+                return False
+
+            @staticmethod
+            def is_replicate():
+                return True
+
+        mesh = _FakeMesh((2, 8), ("dp_replicate", "dp_shard_sp"))
+        param = SimpleNamespace(device_mesh=mesh, placements=(HyperReplicate(), HyperShard()))
+
+        submesh = _fsdp_all2all_submesh(param)
+
+        assert mesh.sliced_with == "dp_shard_sp"
+        assert submesh.ndim == 1
+        assert submesh.size(0) == 8
+
     def test_pending_reduction_is_not_eligible(self):
         """A Partial() dim owes a reduction, so the gather cannot be skipped."""
         mesh = _FakeMesh((2, 8), ("dp_replicate", "dp_shard_sp"))
@@ -940,20 +968,43 @@ class TestHeadSplitUpdate:
     def _per_block_reference(self, grad: torch.Tensor, head_blocks: int) -> torch.Tensor:
         rows = grad.shape[0] // head_blocks
         return torch.cat(
-            [run_newton_schulz(grad[i * rows : (i + 1) * rows], ns_implementation="std") for i in range(head_blocks)],
+            [
+                run_newton_schulz(
+                    grad[i * rows : (i + 1) * rows], ns_implementation="std", compute_dtype=torch.float32
+                )
+                for i in range(head_blocks)
+            ],
             dim=0,
         )
 
-    def test_update_matches_per_block_newton_schulz(self):
-        head_blocks, rows, cols = 8, 16, 32
+    @pytest.mark.parametrize("rows,cols", [(16, 32), (32, 16)])
+    def test_update_matches_per_block_newton_schulz(self, monkeypatch, rows, cols):
+        # Isolate block slicing from BF16 addmm/baddbmm rounding differences.
+        def fp32_newton_schulz(*args, **kwargs):
+            return run_newton_schulz(*args, **kwargs, compute_dtype=torch.float32)
+
+        monkeypatch.setattr("veomni.optim.muon.run_newton_schulz", fp32_newton_schulz)
+        head_blocks = 8
         grad = _sample_2d(head_blocks * rows, cols, seed=11)
         p = nn.Parameter(torch.zeros_like(grad))
         p.grad = grad.clone()
 
         _head_split_muon(p, head_blocks).step()
 
-        # rows <= cols keeps _adjust_lr at 1.0, so the update is the raw polar factor.
-        torch.testing.assert_close(-p.detach(), self._per_block_reference(grad, head_blocks))
+        # Even adjust_lr_fn=None applies the default aspect-ratio scaling.
+        block_factor = upstream_adjust_lr(1.0, None, (rows, cols))
+        torch.testing.assert_close(-p.detach(), block_factor * self._per_block_reference(grad, head_blocks))
+
+    def _batched_reference(self, grad: torch.Tensor, head_blocks: int) -> torch.Tensor:
+        blocks = grad.reshape(head_blocks, grad.shape[0] // head_blocks, grad.shape[1])
+        return run_newton_schulz(blocks, ns_implementation="std").reshape_as(grad)
+
+    def test_update_matches_batched_newton_schulz(self):
+        grad = _sample_2d(128, 32, seed=5)
+        p = nn.Parameter(torch.zeros_like(grad))
+        p.grad = grad.clone()
+        _head_split_muon(p, head_blocks=8).step()
+        torch.testing.assert_close(-p.detach(), self._batched_reference(grad, 8))
 
     @pytest.mark.parametrize("adjust_lr_fn", ["original", "match_rms_adamw"])
     def test_lr_adjust_follows_the_block_shape(self, adjust_lr_fn):
@@ -969,7 +1020,9 @@ class TestHeadSplitUpdate:
         block_factor = upstream_adjust_lr(1.0, adjust_lr_fn, (block_rows, cols))
         full_factor = upstream_adjust_lr(1.0, adjust_lr_fn, (rows, cols))
         assert block_factor < full_factor
-        torch.testing.assert_close(-p.detach(), block_factor * self._per_block_reference(grad, head_blocks))
+        # Match the production BF16 batch path; this test checks LR scaling,
+        # not numerical equality between addmm and baddbmm kernels.
+        torch.testing.assert_close(-p.detach(), block_factor * self._batched_reference(grad, head_blocks))
 
     def test_split_and_full_updates_differ(self):
         """Guard against the split silently degenerating into full-matrix Muon."""
