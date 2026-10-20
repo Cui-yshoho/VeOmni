@@ -13,10 +13,12 @@
 # limitations under the License.
 
 import builtins
+import copy
 import importlib
 import json
 import sys
 import types
+from functools import partial
 
 import pytest
 import torch
@@ -47,6 +49,11 @@ from veomni.checkpoint.hyper_parallel_checkpointer import (
     _validate_topology,
 )
 from veomni.distributed import hyper_fsdp2, torch_parallelize
+from veomni.distributed.fsdp2.submodule_prefetch import (
+    build_submodule_prefetch_stages,
+    configure_submodule_prefetch,
+    resolve_submodule_wrap_targets,
+)
 from veomni.distributed.hyper_fsdp2 import extra_parallel_gradient_scaling_factor
 from veomni.distributed.torch_parallelize import (
     _build_root_fsdp_kwargs,
@@ -60,6 +67,7 @@ from veomni.optim import optimizer as optimizer_module
 
 def test_optional_backends_default_to_existing_implementations():
     assert FSDPConfig().fsdp_backend == "torch"
+    assert not hasattr(FSDPConfig(), "hyper_wrap_modules")
     assert OptimizerConfig(type="muon").use_hyper_optimizer is False
     assert build_checkpointer("dcp", "fsdp2") is DistributedCheckpointer
 
@@ -96,6 +104,7 @@ def test_build_parallelize_model_omits_backend_kwarg_on_default_torch_route(monk
         is model
     )
     assert "fsdp_backend" not in calls[-1]
+    assert "hyper_wrap_modules" not in calls[-1]
 
     build_parallelize_model(
         model,
@@ -321,7 +330,283 @@ def test_hyper_optimizer_requires_muon():
         OptimizerConfig(type="adamw", use_hyper_optimizer=True)
 
 
-def test_hyper_optimizer_rejects_unsupported_muon_layouts():
+class PrefetchUnit(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(2, 2))
+
+    def set_modules_to_forward_prefetch(self, modules):
+        self.forward_configurations = getattr(self, "forward_configurations", 0) + 1
+        self.forward_targets = modules
+
+    def set_modules_to_backward_prefetch(self, modules):
+        self.backward_targets = modules
+
+
+class PrefetchBlock(PrefetchUnit):
+    def __init__(self):
+        super().__init__()
+        self.second = PrefetchUnit()
+        self.first = PrefetchUnit()
+
+
+class Qwen3MoeDecoderLayer(PrefetchUnit):
+    def __init__(self):
+        super().__init__()
+        # Registration order does not determine forward execution order.
+        self.mlp = PrefetchUnit()
+        self.self_attn = PrefetchUnit()
+
+
+@pytest.mark.parametrize(
+    "device, compiled, known",
+    [
+        ("cuda", False, True),
+        ("npu", False, True),
+        ("cpu", False, True),
+        ("cuda", True, True),
+        ("cuda", False, False),
+    ],
+)
+def test_submodule_wrap_uses_safe_internal_defaults(device, compiled, known):
+    root = nn.Module()
+    root.block = Qwen3MoeDecoderLayer() if known else PrefetchBlock()
+    result = resolve_submodule_wrap_targets(
+        [("block", root.block)], root_model=root, device_type=device, compiled=compiled
+    )
+    expected = (
+        {root.block: [root.block.self_attn, root.block.mlp]} if device == "cuda" and not compiled and known else {}
+    )
+    assert result == expected
+
+
+@pytest.mark.parametrize("outside_kind", ["sibling", "other_block", "same_block", "missing_child", "empty_child"])
+def test_submodule_wrap_falls_back_for_unsafe_boundaries(outside_kind):
+    root = nn.Module()
+    root.block = Qwen3MoeDecoderLayer()
+    if outside_kind == "missing_child":
+        del root.block.self_attn
+    elif outside_kind == "empty_child":
+        root.block.self_attn = nn.Identity()
+    elif outside_kind == "same_block":
+        root.block.mlp.weight = root.block.self_attn.weight
+    else:
+        root.outside = PrefetchUnit() if outside_kind == "sibling" else Qwen3MoeDecoderLayer()
+        outside = root.outside if outside_kind == "sibling" else root.outside.self_attn
+        outside.weight = root.block.self_attn.weight
+    assert resolve_submodule_wrap_targets([("block", root.block)], root_model=root, device_type="cuda") == {}
+
+
+@pytest.mark.parametrize("stage_counts", [(3, 3), (1, 3, 2)])
+def test_submodule_forward_targets_are_set_once(stage_counts):
+    stages = [[[PrefetchUnit(), PrefetchUnit()] for _ in range(count)] for count in stage_counts]
+    units = [unit for block in stages for stage in block for unit in stage]
+    configure_submodule_prefetch(stages)
+    assert all(unit.forward_configurations == 1 for unit in units)
+
+
+def test_submodule_prefetch_keeps_nested_expert_and_fp32_units():
+    blocks = [PrefetchBlock(), PrefetchBlock()]
+    stages = []
+    for block in blocks:
+        block.second.router = PrefetchUnit()
+        block.second.experts = PrefetchUnit()
+        existing = [block.second.experts, block.second.router]
+        stages.append(build_submodule_prefetch_stages(block, [block.first, block.second], existing))
+        assert stages[-1] == [[block], [block.first], [block.second, *existing]]
+    configure_submodule_prefetch(stages)
+    first, second = blocks
+    assert first.forward_targets == [first.first]
+    assert first.first.forward_targets == stages[0][2] + [second, second.first]
+    assert first.second.forward_targets == [second, second.first, *stages[1][2]]
+    assert first.second.experts.forward_targets == first.second.forward_targets
+    assert second.backward_targets == stages[1][2]
+    assert second.second.backward_targets == [second.first]
+    assert second.first.backward_targets == [first, *stages[0][2]]
+    assert first.first.backward_targets == []
+    assert second.second.forward_targets == []
+
+
+@pytest.mark.parametrize("backend, interval", [("hyper", 1), ("hyper", 2), ("torch", 1)])
+@pytest.mark.parametrize(
+    "device, known, prefetch",
+    [
+        ("cuda", True, True),
+        ("cuda", True, False),
+        ("npu", True, True),
+        ("cuda", False, True),
+    ],
+)
+def test_submodule_wrap_integration_uses_internal_device_policy(
+    monkeypatch, device, known, prefetch, backend, interval
+):
+    model = nn.Module()
+    block_type = Qwen3MoeDecoderLayer if known else PrefetchBlock
+    model.layers = nn.ModuleList([block_type(), block_type()])
+    model._no_split_modules = [block_type.__name__]
+    state = types.SimpleNamespace(any_extra_parallel_enabled=False, extra_parallel_names=(), fsdp_mesh=object())
+    monkeypatch.setattr(torch_parallelize, "get_parallel_state", lambda: state)
+    monkeypatch.setattr(torch_parallelize, "get_device_type", lambda: device)
+    monkeypatch.setattr(hyper_fsdp2, "to_hyper_device_mesh", lambda *args: state.fsdp_mesh)
+    monkeypatch.setattr(torch_parallelize, "_materialize_and_load_weights", lambda *args, **kwargs: None)
+    calls, claimed = [], set()
+
+    class WrappedUnit:
+        def set_reduce_comm_interval(self, value):
+            self.reduce_interval = value
+
+    def fake_wrap(module, **options):
+        owned = {id(param) for param in module.parameters()} - claimed
+        claimed.update(owned)
+        calls.append((module, options, owned))
+        module.__class__ = type("Wrapped" + type(module).__name__, (type(module), WrappedUnit), {})
+
+    monkeypatch.setattr(torch_parallelize, "fully_shard", fake_wrap)
+    monkeypatch.setattr(torch_parallelize, "FSDPModule", WrappedUnit)
+    if backend == "torch":
+
+        def reject_hyper_planner(*args, **kwargs):
+            pytest.fail("Torch-native must not enter the Hyper wrap planner")
+
+        monkeypatch.setattr(
+            sys.modules[resolve_submodule_wrap_targets.__module__],
+            "resolve_submodule_wrap_targets",
+            reject_hyper_planner,
+        )
+    monkeypatch.setattr(
+        hyper_fsdp2,
+        "get_hyper_fsdp2_api",
+        lambda: {
+            "fully_shard": fake_wrap,
+            "module_type": WrappedUnit,
+            "mixed_precision_policy": object,
+            "cpu_offload_policy": object,
+            "shard": Shard,
+            "distribute_tensor": object,
+        },
+    )
+    blocks = list(model.layers)
+    parallelize_model_fsdp2(
+        model,
+        fsdp_backend=backend,
+        mixed_precision=types.SimpleNamespace(enable=False),
+        init_device="meta",
+        enable_forward_prefetch=prefetch,
+        hyper_reduce_comm_interval=interval,
+    )
+    if backend == "hyper" and device == "cuda" and known:
+        assert [call[0] for call in calls] == [
+            blocks[0].self_attn,
+            blocks[0].mlp,
+            blocks[0],
+            blocks[1].self_attn,
+            blocks[1].mlp,
+            blocks[1],
+            model,
+        ]
+        assert calls[2][2] == {id(blocks[0].weight)}
+        if prefetch:
+            assert blocks[0].self_attn.forward_targets == [blocks[0].mlp, blocks[1], blocks[1].self_attn]
+            assert blocks[0].mlp.forward_targets == [blocks[1], blocks[1].self_attn, blocks[1].mlp]
+        else:
+            assert not hasattr(blocks[0].self_attn, "forward_targets")
+    else:
+        assert [call[0] for call in calls] == [*blocks, model]
+        if backend == "hyper":
+            assert blocks[0].forward_targets == [blocks[1]]
+        else:
+            assert not hasattr(blocks[0], "forward_targets")
+    if backend == "hyper":
+        assert calls[-1][1]["reshard_after_forward"] is False
+    else:
+        assert "reshard_after_forward" not in calls[-1][1]
+    assert claimed == {id(param) for param in model.parameters()}
+    assert getattr(model, "reduce_interval", None) == (interval if interval != 1 else None)
+
+
+@pytest.mark.parametrize("interval", [0, -1, True, 1.5, "2"])
+def test_reduce_interval_rejects_invalid_values(interval):
+    with pytest.raises(ValueError, match="positive integer"):
+        FSDPConfig(fsdp_backend="hyper", hyper_reduce_comm_interval=interval)
+    with pytest.raises(ValueError, match="positive integer"):
+        parallelize_model_fsdp2(nn.Linear(2, 2), fsdp_backend="hyper", hyper_reduce_comm_interval=interval)
+
+
+def test_reduce_interval_is_hyper_only():
+    assert FSDPConfig().hyper_reduce_comm_interval == 1
+    with pytest.raises(ValueError, match="requires fsdp_backend"):
+        FSDPConfig(hyper_reduce_comm_interval=2)
+    with pytest.raises(ValueError, match="requires fsdp_backend"):
+        parallelize_model_fsdp2(nn.Linear(2, 2), hyper_reduce_comm_interval=2)
+
+
+@pytest.mark.parametrize("family", ["qwen3_moe", "qwen3_vl_moe"])
+def test_submodule_declarations_resolve_real_qwen_meta_models(family):
+    from transformers import (
+        Qwen3MoeConfig,
+        Qwen3MoeForCausalLM,
+        Qwen3VLMoeConfig,
+        Qwen3VLMoeForConditionalGeneration,
+    )
+
+    text_options = dict(
+        vocab_size=64,
+        hidden_size=16,
+        intermediate_size=32,
+        moe_intermediate_size=16,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        num_experts=4,
+        num_experts_per_tok=2,
+        head_dim=8,
+    )
+    if family == "qwen3_moe":
+        config = Qwen3MoeConfig(**text_options)
+        model_class = Qwen3MoeForCausalLM
+        policy = {"Qwen3MoeDecoderLayer": ["self_attn", "mlp"]}
+        expected_blocks = 2
+    else:
+        config = Qwen3VLMoeConfig(
+            text_config=text_options,
+            vision_config=dict(
+                depth=1,
+                hidden_size=16,
+                intermediate_size=32,
+                num_heads=2,
+                out_hidden_size=16,
+                deepstack_visual_indexes=[],
+            ),
+        )
+        model_class = Qwen3VLMoeForConditionalGeneration
+        policy = {
+            "Qwen3VLMoeVisionBlock": ["attn", "mlp"],
+            "Qwen3VLMoeTextDecoderLayer": ["self_attn", "mlp"],
+        }
+        expected_blocks = 3
+    with torch.device("meta"):
+        model = model_class(config)
+    targets = [(name, module) for name, module in model.named_modules() if type(module).__name__ in policy]
+    resolved = resolve_submodule_wrap_targets(targets, root_model=model, device_type="cuda")
+    assert len(resolved) == expected_blocks
+    assert all(len(children) == 2 for children in resolved.values())
+    assert all(param.is_meta for param in model.parameters())
+
+
+def test_submodule_prefetch_supports_three_arbitrary_stages():
+    block = PrefetchBlock()
+    block.third = PrefetchUnit()
+    stages = build_submodule_prefetch_stages(block, [block.first, block.second, block.third], [])
+    configure_submodule_prefetch([stages])
+    assert block.first.forward_targets == [block.second, block.third]
+    assert block.second.forward_targets == [block.third]
+    assert block.third.backward_targets == [block.second]
+    assert block.second.backward_targets == [block.first]
+
+
+@pytest.mark.parametrize("device", ["cpu", "npu", "mlu"])
+def test_hyper_optimizer_rejects_unsupported_muon_layouts(monkeypatch, device):
+    monkeypatch.setattr(optimizer_module, "get_device_type", lambda: device)
     model = nn.Linear(4, 4)
     with pytest.raises(ValueError, match="muon_ns_implementation='std'"):
         optimizer_module.build_optimizer(
@@ -331,12 +616,17 @@ def test_hyper_optimizer_rejects_unsupported_muon_layouts():
         )
 
 
-def test_hyper_optimizer_is_lazy_and_reuses_veomni_parameter_split(monkeypatch):
+@pytest.mark.parametrize(
+    ("device", "implementation"),
+    [("cpu", "std"), ("npu", "std"), ("cuda", "std"), ("cuda", "gram"), ("cuda", "gram_quack")],
+)
+def test_hyper_optimizer_is_lazy_and_reuses_veomni_parameter_split(monkeypatch, device, implementation):
     captured = {}
-    sentinel = object()
+    sentinel = types.SimpleNamespace(optimizers_dict={})
 
     def fake_get_hyper_optimizer(**kwargs):
         captured.update(kwargs)
+        sentinel.optimizers_dict["muon"] = torch.optim.SGD(kwargs["muon_params"], lr=1e-3)
         return sentinel
 
     hyper_parallel = types.ModuleType("hyper_parallel")
@@ -348,9 +638,16 @@ def test_hyper_optimizer_is_lazy_and_reuses_veomni_parameter_split(monkeypatch):
     monkeypatch.setitem(sys.modules, "hyper_parallel.core.optimizer", hyper_optimizer)
     monkeypatch.setattr(optimizer_module, "_should_build_extra_parallel_aware", lambda _model: False)
     monkeypatch.setattr(hyper_fsdp2, "wrap_optimizer", lambda _optimizer: None)
+    monkeypatch.setattr(optimizer_module, "get_device_type", lambda: device)
 
     model = nn.Linear(4, 4)
-    config = OptimizerConfig(type="muon", use_hyper_optimizer=True, muon_ns_steps=3, muon_ns_implementation="std")
+    config = OptimizerConfig(
+        type="muon",
+        use_hyper_optimizer=True,
+        muon_ns_steps=3,
+        muon_ns_implementation=implementation,
+        muon_gram_ns_reset_iterations=[1],
+    )
     result = optimizer_module.build_optimizer(
         model,
         lr=1e-3,
@@ -366,6 +663,83 @@ def test_hyper_optimizer_is_lazy_and_reuses_veomni_parameter_split(monkeypatch):
     assert captured["muon_kwargs"]["muon_ns_variant"] == "custom"
     assert captured["muon_kwargs"]["muon_ns_coefficients"] == [(3.4445, -4.775, 2.0315)] * 3
     assert captured["muon_kwargs"]["muon_ns_epsilon"] == 1e-7
+    callback = captured["muon_kwargs"].get("muon_zeropower_fn")
+    if implementation == "std":
+        assert callback is None
+    else:
+        calls = {}
+
+        def fake_ns(grad, **kwargs):
+            calls.update(kwargs)
+            return grad + 1
+
+        monkeypatch.setattr(muon_module, "run_newton_schulz", fake_ns)
+        for shape in [(4, 3), (2, 4, 3)]:
+            grad = torch.zeros(shape)
+            torch.testing.assert_close(callback(grad, steps=3), grad + 1)
+        assert calls == {
+            "ns_steps": 3,
+            "ns_coefficients": (3.4445, -4.775, 2.0315),
+            "eps": 1e-7,
+            "ns_implementation": implementation,
+            "gram_ns_reset_iterations": (1,),
+        }
+
+
+@pytest.mark.parametrize("shape", [(8, 4), (2, 8, 4), (4, 8)])
+def test_hyper_muon_gram_callback_matches_native_dispatch(shape):
+    grad = torch.randn(shape, generator=torch.Generator().manual_seed(42), dtype=torch.bfloat16)
+    kwargs = {"ns_implementation": "gram", "eps": 1e-7, "gram_ns_reset_iterations": (2,)}
+    actual = optimizer_module._run_hyper_muon_newton_schulz(grad, steps=5, **kwargs)
+    expected = muon_module.run_newton_schulz(grad, ns_steps=5, **kwargs)
+    assert actual.shape == grad.shape
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("changed", [None, "signature", "coefficients", "epsilon", "steps", "missing"])
+def test_hyper_muon_callback_resume_checks_settings(changed):
+    optimizer = torch.optim.SGD([nn.Parameter(torch.ones(4, 3))], lr=1e-3)
+    callback = partial(
+        optimizer_module._run_hyper_muon_newton_schulz,
+        ns_coefficients=(3.4445, -4.775, 2.0315),
+        eps=1e-7,
+        ns_implementation="gram_quack",
+        gram_ns_reset_iterations=(2,),
+    )
+    optimizer.param_groups[0].update(ns_coefficients=[(3.4445, -4.775, 2.0315)] * 5, ns_epsilon=1e-7, ns_steps=5)
+    optimizer_module._guard_hyper_muon_callback_resume(optimizer, callback, 5)
+    state = copy.deepcopy(optimizer.state_dict())
+    group = state["param_groups"][0]
+    if changed == "signature":
+        group["veomni_ns_callback"] = group["veomni_ns_callback"].replace("gram_quack", "gram")
+    elif changed == "coefficients":
+        group["ns_coefficients"] = [(1.0, 2.0, 3.0)] * 5
+    elif changed == "epsilon":
+        group["ns_epsilon"] = 1e-6
+    elif changed == "steps":
+        group["ns_steps"] = 4
+    elif changed == "missing":
+        del group["veomni_ns_callback"]
+    if changed is None:
+        optimizer.load_state_dict(state)
+        assert optimizer.param_groups[0]["veomni_ns_callback"] == group["veomni_ns_callback"]
+    else:
+        with pytest.raises(ValueError, match="checkpoint settings"):
+            optimizer.load_state_dict(state)
+
+
+@pytest.mark.parametrize("callback_state", [False, True])
+def test_hyper_muon_std_rejects_callback_checkpoint(callback_state):
+    optimizer = torch.optim.SGD([nn.Parameter(torch.ones(4, 3))], lr=1e-3)
+    optimizer_module._guard_hyper_muon_callback_resume(optimizer, None, 5)
+    state = copy.deepcopy(optimizer.state_dict())
+    if callback_state:
+        state["param_groups"][0]["veomni_ns_callback"] = "gram_quack"
+        with pytest.raises(ValueError, match="cannot be restored into std"):
+            optimizer.load_state_dict(state)
+    else:
+        optimizer.load_state_dict(state)
 
 
 @pytest.mark.parametrize(

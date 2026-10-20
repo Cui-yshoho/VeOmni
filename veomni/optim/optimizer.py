@@ -15,6 +15,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+from functools import partial
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import torch
@@ -31,6 +33,7 @@ from torch.optim.optimizer import Optimizer
 
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
+from ..utils.device import get_device_type
 from .muon import DistributedMuon, infer_head_block_counts, split_muon_adamw_params
 
 
@@ -462,6 +465,41 @@ def _collect_muon_kwargs(optimizer_cfg: "OptimizerConfig") -> Dict[str, Any]:
     }
 
 
+def _run_hyper_muon_newton_schulz(grad: torch.Tensor, steps: int, **kwargs) -> torch.Tensor:
+    """Adapt Hyper's owner-batched callback to VeOmni's NS dispatcher."""
+    from .muon import run_newton_schulz
+
+    return run_newton_schulz(grad, ns_steps=steps, **kwargs)
+
+
+def _guard_hyper_muon_callback_resume(optimizer, callback, ns_steps: int) -> None:
+    """Persist callback settings and reject inconsistent optimizer restores."""
+    if callback is None:
+
+        def reject_callback_state(_optimizer, state_dict):
+            if any("veomni_ns_callback" in group for group in state_dict["param_groups"]):
+                raise ValueError("Hyper Muon Gram/QuACK checkpoint settings cannot be restored into std.")
+
+        optimizer.register_load_state_dict_pre_hook(reject_callback_state)
+        return
+    signature = json.dumps(dict(callback.keywords, ns_steps=ns_steps), sort_keys=True)
+    coefficients = [tuple(callback.keywords["ns_coefficients"])] * ns_steps
+
+    def validate_state_dict(_optimizer, state_dict):
+        for group in state_dict["param_groups"]:
+            if (
+                group.get("veomni_ns_callback") != signature
+                or [tuple(row) for row in group.get("ns_coefficients", ())] != coefficients
+                or group.get("ns_epsilon") != callback.keywords["eps"]
+                or group.get("ns_steps") != ns_steps
+            ):
+                raise ValueError("Hyper Muon Gram/QuACK checkpoint settings do not match the configured NS callback.")
+
+    for group in optimizer.param_groups:
+        group["veomni_ns_callback"] = signature
+    optimizer.register_load_state_dict_pre_hook(validate_state_dict)
+
+
 def _build_hyper_muon_with_adamw(
     model: "nn.Module",
     lr: float,
@@ -493,10 +531,11 @@ def _build_hyper_muon_with_adamw(
     if adjust_lr_fn != "match_rms_adamw":
         raise ValueError("use_hyper_optimizer=True currently supports only muon_adjust_lr_fn='match_rms_adamw'.")
     ns_implementation = muon_kwargs.get("ns_implementation", "gram_quack")
-    if ns_implementation != "std":
+    if ns_implementation not in ("std", "gram", "gram_quack"):
+        raise ValueError(f"Unknown Hyper Muon ns_implementation={ns_implementation!r}")
+    if ns_implementation != "std" and get_device_type() != "cuda":
         raise ValueError(
-            "use_hyper_optimizer=True requires muon_ns_implementation='std'; "
-            "HyperParallel does not implement VeOmni's Gram/Quack reset schedule."
+            "Non-CUDA Hyper Muon requires muon_ns_implementation='std'; Gram/Quack callbacks are enabled only on CUDA."
         )
     muon_lr = muon_kwargs.get("lr")
     if muon_lr is None:
@@ -518,6 +557,15 @@ def _build_hyper_muon_with_adamw(
     ns_coefficients = tuple(float(value) for value in muon_kwargs.get("ns_coefficients", (3.4445, -4.775, 2.0315)))
     if len(ns_coefficients) != 3:
         raise ValueError("HyperParallel Muon requires exactly three muon_ns_coefficients values.")
+    ns_callback_kwargs = {}
+    if ns_implementation != "std":
+        ns_callback_kwargs["muon_zeropower_fn"] = partial(
+            _run_hyper_muon_newton_schulz,
+            ns_coefficients=ns_coefficients,
+            eps=float(muon_kwargs.get("eps", 1e-7)),
+            ns_implementation=ns_implementation,
+            gram_ns_reset_iterations=tuple(muon_kwargs.get("gram_ns_reset_iterations", (2,))),
+        )
     try:
         from hyper_parallel.core.optimizer import get_hyper_optimizer
     except ImportError as exc:
@@ -538,6 +586,7 @@ def _build_hyper_muon_with_adamw(
             "muon_ns_variant": "custom",
             "muon_ns_coefficients": [ns_coefficients] * ns_steps,
             "muon_ns_epsilon": float(muon_kwargs.get("eps", 1e-7)),
+            **ns_callback_kwargs,
         },
         adamw_kwargs={
             "adamw_lr": float(lr),
@@ -546,6 +595,9 @@ def _build_hyper_muon_with_adamw(
             "adamw_eps": eps,
             "fused": fused,
         },
+    )
+    _guard_hyper_muon_callback_resume(
+        optimizer.optimizers_dict["muon"], ns_callback_kwargs.get("muon_zeropower_fn"), ns_steps
     )
     from ..distributed.hyper_fsdp2 import wrap_optimizer
 

@@ -622,6 +622,10 @@ class FSDPConfig:
         default="torch",
         metadata={"help": "FSDP2 implementation backend."},
     )
+    hyper_reduce_comm_interval: int = field(
+        default=1,
+        metadata={"help": "Hyper FSDP units between gradient reduction submission and waiting."},
+    )
 
     def __post_init__(self):
         if self.fsdp_mode not in ("ddp", "fsdp2", "eager"):
@@ -639,6 +643,10 @@ class FSDPConfig:
             raise ValueError(f"Unsupported fsdp_backend={self.fsdp_backend!r}; expected 'torch' or 'hyper'.")
         if self.fsdp_mode != "fsdp2" and self.fsdp_backend != "torch":
             raise ValueError("fsdp_backend='hyper' requires fsdp_mode='fsdp2'.")
+        if type(self.hyper_reduce_comm_interval) is not int or self.hyper_reduce_comm_interval < 1:
+            raise ValueError("hyper_reduce_comm_interval must be a positive integer.")
+        if self.hyper_reduce_comm_interval != 1 and self.fsdp_backend != "hyper":
+            raise ValueError("hyper_reduce_comm_interval > 1 requires fsdp_backend='hyper'.")
 
 
 @dataclass

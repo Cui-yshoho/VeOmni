@@ -257,6 +257,8 @@ class OmniModelRuntime:
         }
         if any(kwargs["module_is_peft_model"].values()):
             kwargs["is_peft_model"] = True
+        if acc.fsdp_config.hyper_reduce_comm_interval != 1:
+            kwargs["hyper_reduce_comm_interval"] = acc.fsdp_config.hyper_reduce_comm_interval
 
         from .....distributed.torch_compile import CompileConfig
         from .....distributed.torch_parallelize import build_parallelize_model

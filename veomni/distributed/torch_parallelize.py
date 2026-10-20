@@ -460,8 +460,13 @@ def parallelize_model_fsdp2(
     if fsdp_backend not in ("torch", "hyper"):
         raise ValueError(f"Unsupported fsdp_backend={fsdp_backend!r}; expected 'torch' or 'hyper'.")
 
-    parallel_state = get_parallel_state()
     use_hyper_fsdp2 = fsdp_backend == "hyper"
+    reduce_comm_interval = kwargs.pop("hyper_reduce_comm_interval", 1)
+    if type(reduce_comm_interval) is not int or reduce_comm_interval < 1:
+        raise ValueError("hyper_reduce_comm_interval must be a positive integer.")
+    if reduce_comm_interval != 1 and not use_hyper_fsdp2:
+        raise ValueError("hyper_reduce_comm_interval > 1 requires fsdp_backend='hyper'.")
+    parallel_state = get_parallel_state()
     if use_hyper_fsdp2:
         from .hyper_fsdp2 import (
             extra_parallel_gradient_scaling_factor,
@@ -518,6 +523,16 @@ def parallelize_model_fsdp2(
         if _is_fsdp_wrap_target(fqn, mod.__class__.__name__, target_classes)
     ]
     logger.info_rank0(f"target classes to shard: {target_classes}")
+    submodule_wrap_targets = {}
+    if use_hyper_fsdp2:
+        from .fsdp2.submodule_prefetch import resolve_submodule_wrap_targets
+
+        submodule_wrap_targets = resolve_submodule_wrap_targets(
+            target_modules,
+            root_model=model,
+            device_type=get_device_type(),
+            compiled=compile_config is not None and compile_config.enable,
+        )
 
     model._veomni_compile_enabled = False
     compile_config = compile_config or CompileConfig()
@@ -601,6 +616,13 @@ def parallelize_model_fsdp2(
         persistent_para_names = set()
         _extra_parallel_mesh = None
         _extra_parallel_map = None
+
+    if use_hyper_fsdp2 and persistent_extra_parallel_params:
+        submodule_wrap_targets = {
+            block: children
+            for block, children in submodule_wrap_targets.items()
+            if not any(param in persistent_extra_parallel_params for param in block.parameters())
+        }
 
     # Extract ExtraParallel modules from the target classes if any, then pair them.
     # Regard each target module as a layer.
@@ -801,6 +823,7 @@ def parallelize_model_fsdp2(
     #   e.g. sorted_fqn_list = ['decoder.embed_tokens', 'embed_tokens', 'decoder']
     sorted_fqn_list = sort_fqn_by_submodule_first(list(layer_pairs.keys()))
     layer_pairs_list = [(fqn, layer_pairs[fqn]) for fqn in sorted_fqn_list]
+    submodule_prefetch_stages = {}
     if use_low_precision_transport:
         transport_reduction_scales = {}
         transport_policy = ReduceScatterTransportPolicy()
@@ -867,6 +890,17 @@ def parallelize_model_fsdp2(
                     # gradients need native FP32 communication, not a lossy wire cast.
                     layer_mod._fsdp_modules.append(sub_mod)
 
+        if layer_mod in submodule_wrap_targets:
+            from .fsdp2.submodule_prefetch import build_submodule_prefetch_stages
+
+            children = submodule_wrap_targets[layer_mod]
+            existing_units = list(layer_mod._fsdp_modules)
+            for child in children:
+                if not isinstance(child, fsdp_module_type):
+                    apply_fully_shard(child, fsdp_kwargs)
+                    layer_mod._fsdp_modules.append(child)
+            submodule_prefetch_stages[layer_mod] = build_submodule_prefetch_stages(layer_mod, children, existing_units)
+
         # Shard everything else in the module:
         #   Note:
         #      if we have a model and layer_pairs_list like the above,
@@ -893,6 +927,11 @@ def parallelize_model_fsdp2(
     # above pass `reshard_after_forward` explicitly).
     root_fsdp_kwargs = _build_root_fsdp_kwargs(fsdp_kwargs, use_hyper_fsdp2)
     apply_fully_shard(model, root_fsdp_kwargs)
+    if reduce_comm_interval != 1:
+        set_interval = getattr(model, "set_reduce_comm_interval", None)
+        if set_interval is None:
+            raise RuntimeError("This HyperParallel version does not support set_reduce_comm_interval.")
+        set_interval(reduce_comm_interval)
     # Persistent ExtraParallel parameters are ignored by every FSDP group and
     # retain their original 2D DTensor identity. Record them after wrapping so
     # gradient clipping can reduce their unique local shards once over the
@@ -917,7 +956,25 @@ def parallelize_model_fsdp2(
     need_manual_prefetch = (
         use_hyper_fsdp2 or parallel_state.any_extra_parallel_enabled or mp_ignored_classes is not None
     ) and kwargs.pop("enable_forward_prefetch", True)
-    if need_manual_prefetch:
+    if need_manual_prefetch and submodule_wrap_targets:
+        from .fsdp2.submodule_prefetch import configure_submodule_prefetch
+
+        # Traversal orders blocks; the internal boundaries define stage order.
+        # Do not reuse the bottom-up wrapping order here.
+        block_stages = [
+            submodule_prefetch_stages[block]
+            if block in submodule_prefetch_stages
+            else [list(reversed(block._fsdp_modules))]
+            for _, block in target_modules
+        ]
+        configure_submodule_prefetch(block_stages)
+        logger.info_rank0("[hyper-forward-prefetch] policy=stage depth=2")
+        module_names = {id(module): name for name, module in model.named_modules()}
+        logger.info_rank0(
+            "[hyper-submodule-prefetch] stages="
+            f"{[[[module_names[id(unit)] for unit in stage] for stage in stages] for stages in block_stages]}"
+        )
+    elif need_manual_prefetch:
         blocks = [pair[1][0] for pair in layer_pairs_list]  # all target modules
         next_blocks = blocks[1:] + [None]
         for current_block, next_block in zip(blocks, next_blocks):
