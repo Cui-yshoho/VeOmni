@@ -907,24 +907,25 @@ def parallelize_model_fsdp2(
         #      when layer_mod (also called as target module, e.g. decoder.embed_tokens),
         #      is the parent of or equal to extra_parallel_mod[para] (e.g. ToyEmbed),
         #      no need to shard layer_mod again.
-        if not isinstance(layer_mod, fsdp_module_type):
+        if layer_mod not in submodule_wrap_targets and not isinstance(layer_mod, fsdp_module_type):
             apply_fully_shard(layer_mod, fsdp_kwargs)
             if transport_reduction_scales is not None and fsdp_transport_enabled:
                 transport_reduction_scales[layer_mod] = fsdp_reduction_scale
             layer_mod._fsdp_modules.append(layer_mod)
         logger.info_rank0(f"{layer_fqn=}, {layer_mod._fsdp_modules=}")
 
-    # Keep the root unsharded between forward and backward. PyTorch requires
+    if submodule_wrap_targets:
+        for module in (model.get_input_embeddings(), model.get_output_embeddings()):
+            if not isinstance(module, fsdp_module_type):
+                apply_fully_shard(module, fsdp_kwargs)
+
+    # Keep the root's remaining parameters unsharded between forward and backward. PyTorch requires
     # omitting `reshard_after_forward` to trigger its root auto-no-reshard
     # behavior (`_fsdp_state.py:_lazy_init`), while Hyper requires an explicit
     # False because its omitted-value default is True.
-    # This keeps the root's params (lm_head + embeddings + final norm)
-    # unsharded between forward and backward, which is what fused-linear
-    # kernels (chunk_logprobs / chunk_topk_distill) need — they save the
-    # lm_head weight via `save_for_backward` and would otherwise hit
-    # `setStorage … storage of size 0` when the saved reference points
-    # to a freed buffer. Decoder layers reshard normally (their calls
-    # above pass `reshard_after_forward` explicitly).
+    # Split blocks leave their decoder norms here. Unsplit models also leave
+    # embeddings and lm_head here for fused-linear kernels that access weights
+    # directly instead of calling the corresponding module.
     root_fsdp_kwargs = _build_root_fsdp_kwargs(fsdp_kwargs, use_hyper_fsdp2)
     apply_fully_shard(model, root_fsdp_kwargs)
     if reduce_comm_interval != 1:
@@ -967,7 +968,14 @@ def parallelize_model_fsdp2(
             else [list(reversed(block._fsdp_modules))]
             for _, block in target_modules
         ]
+        block_stages.insert(0, [[model.get_input_embeddings()]])
+        block_stages.append([[model.get_output_embeddings()]])
         configure_submodule_prefetch(block_stages)
+        for unit in block_stages[1][-1]:
+            unit.set_modules_to_backward_prefetch(block_stages[1][0] + block_stages[0][0])
+        model.get_output_embeddings().set_modules_to_backward_prefetch(
+            [unit for stage in reversed(block_stages[-2]) for unit in stage]
+        )
         logger.info_rank0("[hyper-forward-prefetch] policy=stage depth=2")
         module_names = {id(module): name for name, module in model.named_modules()}
         logger.info_rank0(
