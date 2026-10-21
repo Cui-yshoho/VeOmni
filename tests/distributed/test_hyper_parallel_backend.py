@@ -375,7 +375,9 @@ def test_submodule_wrap_uses_safe_internal_defaults(device, compiled, known):
         [("block", root.block)], root_model=root, device_type=device, compiled=compiled
     )
     expected = (
-        {root.block: [root.block.self_attn, root.block.mlp]} if device == "cuda" and not compiled and known else {}
+        {root.block: [root.block.self_attn, root.block.mlp]}
+        if device in ("cuda", "npu") and not compiled and known
+        else {}
     )
     assert result == expected
 
@@ -413,16 +415,16 @@ def test_submodule_prefetch_keeps_nested_expert_and_fp32_units():
         block.second.experts = PrefetchUnit()
         existing = [block.second.experts, block.second.router]
         stages.append(build_submodule_prefetch_stages(block, [block.first, block.second], existing))
-        assert stages[-1] == [[block], [block.first], [block.second, *existing]]
+        assert stages[-1] == [[block.first], [block.second, *existing]]
     configure_submodule_prefetch(stages)
     first, second = blocks
-    assert first.forward_targets == [first.first]
-    assert first.first.forward_targets == stages[0][2] + [second, second.first]
-    assert first.second.forward_targets == [second, second.first, *stages[1][2]]
+    assert first.first.forward_targets == stages[0][1] + [second.first]
+    assert first.second.forward_targets == [second.first, *stages[1][1]]
     assert first.second.experts.forward_targets == first.second.forward_targets
-    assert second.backward_targets == stages[1][2]
-    assert second.second.backward_targets == [second.first]
-    assert second.first.backward_targets == [first, *stages[0][2]]
+    assert second.second.backward_targets == [first.first, *stages[0][1]]
+    assert second.second.experts.backward_targets == second.second.backward_targets
+    assert second.second.router.backward_targets == second.second.backward_targets
+    assert second.first.backward_targets == [first.first, *stages[0][1]]
     assert first.first.backward_targets == []
     assert second.second.forward_targets == []
 
@@ -441,6 +443,11 @@ def test_submodule_wrap_integration_uses_internal_device_policy(
     monkeypatch, device, known, prefetch, backend, interval
 ):
     model = nn.Module()
+    model.embed_tokens = PrefetchUnit()
+    model.lm_head = PrefetchUnit()
+    model.norm = PrefetchUnit()
+    model.get_input_embeddings = lambda: model.embed_tokens
+    model.get_output_embeddings = lambda: model.lm_head
     block_type = Qwen3MoeDecoderLayer if known else PrefetchBlock
     model.layers = nn.ModuleList([block_type(), block_type()])
     model._no_split_modules = [block_type.__name__]
@@ -494,20 +501,27 @@ def test_submodule_wrap_integration_uses_internal_device_policy(
         enable_forward_prefetch=prefetch,
         hyper_reduce_comm_interval=interval,
     )
-    if backend == "hyper" and device == "cuda" and known:
+    if backend == "hyper" and device in ("cuda", "npu") and known:
         assert [call[0] for call in calls] == [
             blocks[0].self_attn,
             blocks[0].mlp,
-            blocks[0],
             blocks[1].self_attn,
             blocks[1].mlp,
-            blocks[1],
+            model.embed_tokens,
+            model.lm_head,
             model,
         ]
-        assert calls[2][2] == {id(blocks[0].weight)}
+        assert calls[-1][2] == {id(blocks[0].weight), id(blocks[1].weight), id(model.norm.weight)}
         if prefetch:
-            assert blocks[0].self_attn.forward_targets == [blocks[0].mlp, blocks[1], blocks[1].self_attn]
-            assert blocks[0].mlp.forward_targets == [blocks[1], blocks[1].self_attn, blocks[1].mlp]
+            assert model.embed_tokens.forward_targets == [blocks[0].self_attn, blocks[0].mlp]
+            assert blocks[0].self_attn.forward_targets == [blocks[0].mlp, blocks[1].self_attn]
+            assert blocks[0].mlp.forward_targets == [blocks[1].self_attn, blocks[1].mlp]
+            assert blocks[1].self_attn.forward_targets == [blocks[1].mlp, model.lm_head]
+            assert model.lm_head.backward_targets == [blocks[1].mlp, blocks[1].self_attn]
+            assert blocks[1].mlp.backward_targets == [blocks[0].self_attn, blocks[0].mlp]
+            assert blocks[1].self_attn.backward_targets == [blocks[0].self_attn, blocks[0].mlp]
+            assert blocks[0].mlp.backward_targets == [blocks[0].self_attn, model.embed_tokens]
+            assert blocks[0].self_attn.backward_targets == [model.embed_tokens]
         else:
             assert not hasattr(blocks[0].self_attn, "forward_targets")
     else:
