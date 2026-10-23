@@ -257,6 +257,8 @@ class OmniModelRuntime:
         }
         if any(kwargs["module_is_peft_model"].values()):
             kwargs["is_peft_model"] = True
+        if acc.fsdp_config.hyper_reduce_comm_interval != 1:
+            kwargs["hyper_reduce_comm_interval"] = acc.fsdp_config.hyper_reduce_comm_interval
 
         from .....distributed.torch_compile import CompileConfig
         from .....distributed.torch_parallelize import build_parallelize_model
@@ -289,6 +291,8 @@ class OmniModelRuntime:
                 ep_sharded_stream_load=args.ep_sharded_stream_load,
                 max_load_broadcast_size=acc.fsdp_config.max_load_broadcast_size,
                 muon_expert_zero_comm=muon_expert_zero_comm,
+                low_precision_reduce_scatter_comm=acc.fsdp_config.low_precision_reduce_scatter_comm,
+                fsdp_backend=acc.fsdp_config.fsdp_backend,
                 compile_config=compile_config,
                 **kwargs,
             )

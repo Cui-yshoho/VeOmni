@@ -34,6 +34,14 @@ from ..utils import logging
 from .muon import DistributedMuon, infer_head_block_counts, split_muon_adamw_params
 
 
+def _is_fsdp_dtensor(param: torch.Tensor) -> bool:
+    if isinstance(param, DTensor):
+        return True
+    from ..distributed.hyper_parallelize import is_hyper_dtensor
+
+    return is_hyper_dtensor(param)
+
+
 if TYPE_CHECKING:
     from ..arguments import OptimizerConfig
 
@@ -80,8 +88,6 @@ def _collect_ep_replicated_lora_param_ids(model: "nn.Module") -> set[int]:
     from the same post-wrap Parameter objects in the same call, and those
     lists hold long-lived references that prevent garbage collection.
     """
-    from torch.distributed._tensor import DTensor
-
     out: set[int] = set()
     for mod in model.modules():
         # Walk the MRO so we still match after FSDP2's ``fully_shard`` rebases the
@@ -97,7 +103,7 @@ def _collect_ep_replicated_lora_param_ids(model: "nn.Module") -> set[int]:
                 # point, FSDP2 hasn't wrapped yet -- ``build_optimizer`` was
                 # invoked before ``build_parallelize_model``. The snapshot
                 # we are about to take would be stale immediately.
-                assert isinstance(p, DTensor), (
+                assert _is_fsdp_dtensor(p), (
                     f"_collect_ep_replicated_lora_param_ids: LoRA param {n!r} on a "
                     f"LoraSharedExperts wrapper is not a DTensor -- call "
                     f"build_parallelize_model before build_optimizer so FSDP2 has "
@@ -456,6 +462,15 @@ def _collect_muon_kwargs(optimizer_cfg: "OptimizerConfig") -> Dict[str, Any]:
     }
 
 
+def _finalize_optimizer(model, optimizer, *, use_hyper_optimizer=False):
+    """Apply local-shard dispatch once, independently of the optimizer choice."""
+    if use_hyper_optimizer or getattr(model, "_veomni_fsdp_backend", "torch") == "hyper":
+        from .hyper_optimizer import wrap_optimizer
+
+        return wrap_optimizer(optimizer)
+    return optimizer
+
+
 def build_optimizer(
     model: "nn.Module",
     lr: float = 1e-3,
@@ -469,6 +484,7 @@ def build_optimizer(
     no_decay_params: Optional[List[str]] = None,
     muon_kwargs: Optional[Dict[str, Any]] = None,
     optimizer_config: Optional["OptimizerConfig"] = None,
+    use_hyper_optimizer: bool = False,
 ) -> "torch.optim.Optimizer":
     """Build the optimizer.
 
@@ -483,6 +499,7 @@ def build_optimizer(
     if optimizer_type == "muon":
         if optimizer_config is not None:
             muon_kwargs = {**_collect_muon_kwargs(optimizer_config), **(muon_kwargs or {})}
+            use_hyper_optimizer = bool(optimizer_config.use_hyper_optimizer) or use_hyper_optimizer
         if param_groups is not None:
             logger.warning_rank0(
                 "build_optimizer(optimizer_type='muon') ignores the provided "
@@ -490,7 +507,22 @@ def build_optimizer(
                 "split_muon_adamw_params. To control vit vs. backbone learning "
                 "rates with Muon, file a follow-up or use AdamW for now."
             )
-        return _build_muon_with_adamw(
+        if use_hyper_optimizer:
+            from .hyper_muon import build_hyper_muon_with_adamw
+
+            optimizer = build_hyper_muon_with_adamw(
+                model,
+                lr=lr,
+                betas=betas,
+                eps=eps,
+                weight_decay=weight_decay,
+                fused=fused,
+                no_decay_modules=no_decay_modules,
+                no_decay_params=no_decay_params,
+                muon_kwargs=muon_kwargs,
+            )
+            return _finalize_optimizer(model, optimizer, use_hyper_optimizer=True)
+        optimizer = _build_muon_with_adamw(
             model,
             lr=lr,
             betas=betas,
@@ -501,6 +533,10 @@ def build_optimizer(
             no_decay_params=no_decay_params,
             muon_kwargs=muon_kwargs,
         )
+        return _finalize_optimizer(model, optimizer)
+
+    if use_hyper_optimizer or (optimizer_config is not None and optimizer_config.use_hyper_optimizer):
+        raise ValueError("use_hyper_optimizer=True requires optimizer_type='muon'.")
 
     if param_groups is not None:
         param_groups = filter_empty_param_groups(param_groups)
@@ -508,9 +544,10 @@ def build_optimizer(
             raise ValueError("All optimizer param groups are empty; no trainable parameters to optimize.")
 
     if _should_build_extra_parallel_aware(model):
-        return build_extra_parallel_fsdp2_optimizer(
+        optimizer = build_extra_parallel_fsdp2_optimizer(
             model, lr, betas, eps, weight_decay, fused, optimizer_type, param_groups, no_decay_modules, no_decay_params
         )
+        return _finalize_optimizer(model, optimizer)
     if param_groups is None:
         decay_param_names = get_parameter_names(model, no_decay_modules, no_decay_params)
         param_groups = [
@@ -548,12 +585,12 @@ def build_optimizer(
             f"got optimizer_type={optimizer_type!r}."
         )
 
-    return optim
+    return _finalize_optimizer(model, optim)
 
 
 def _is_extra_parallel_param(p: torch.nn.Parameter, extra_parallel_names: Sequence[str]) -> Optional[str]:
     """Return the ExtraParallel name for a DTensor param, or ``None``."""
-    if DTensor is None or not isinstance(p, DTensor):
+    if not _is_fsdp_dtensor(p):
         return None
     mesh = getattr(p, "device_mesh", None)
     names = getattr(mesh, "mesh_dim_names", []) if mesh is not None else []
@@ -830,7 +867,7 @@ def build_extra_parallel_fsdp2_optimizer(
 
                 # Check if this parameter is part of ExtraParallel
                 is_extra_parallel_params = False
-                if DTensor is not None and isinstance(p, DTensor):
+                if _is_fsdp_dtensor(p):
                     mesh = getattr(p, "device_mesh", None)
                     names = getattr(mesh, "mesh_dim_names", []) if mesh is not None else []
                     for para in parallel_state.extra_parallel_names:
@@ -881,7 +918,7 @@ def build_extra_parallel_fsdp2_optimizer(
 
             # Check if this parameter is part of ExtraParallel
             is_extra_parallel_params = False
-            if DTensor is not None and isinstance(p, DTensor):
+            if _is_fsdp_dtensor(p):
                 mesh = getattr(p, "device_mesh", None)
                 names = getattr(mesh, "mesh_dim_names", []) if mesh is not None else []
                 logger.debug_rank0(f"param {name} has device_mesh {mesh} with mesh dim names {names}")

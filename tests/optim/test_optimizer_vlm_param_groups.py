@@ -1,5 +1,6 @@
 """Regression tests for VLM-style optimizer param groups + DCP resume."""
 
+import pytest
 import torch
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
@@ -12,6 +13,105 @@ from veomni.optim.optimizer import (
     filter_empty_param_groups,
     restore_optimizer_param_group_defaults,
 )
+
+
+@pytest.mark.parametrize("fsdp_backend", ["torch", "hyper"])
+@pytest.mark.parametrize("hyper_optimizer", [False, True])
+def test_optimizer_and_fsdp_backends_remain_independent(monkeypatch, fsdp_backend, hyper_optimizer):
+    from veomni.optim import hyper_muon as hyper_muon_module
+    from veomni.optim import hyper_optimizer as hyper_optimizer_module
+    from veomni.optim import optimizer as optimizer_module
+
+    model = torch.nn.Linear(4, 4)
+    model._veomni_fsdp_backend = fsdp_backend
+    optimizer = object()
+    selected, wrapped = [], []
+
+    def native_factory(*args, **kwargs):
+        selected.append("native")
+        return optimizer
+
+    def hyper_factory(*args, **kwargs):
+        selected.append("hyper")
+        return optimizer
+
+    monkeypatch.setattr(optimizer_module, "_build_muon_with_adamw", native_factory)
+    monkeypatch.setattr(hyper_muon_module, "build_hyper_muon_with_adamw", hyper_factory)
+    monkeypatch.setattr(hyper_optimizer_module, "wrap_optimizer", lambda opt: (wrapped.append(opt), opt)[1])
+    result = optimizer_module.build_optimizer(model, optimizer_type="muon", use_hyper_optimizer=hyper_optimizer)
+
+    assert result is optimizer
+    assert selected == ["hyper" if hyper_optimizer else "native"]
+    assert wrapped == ([optimizer] if hyper_optimizer or fsdp_backend == "hyper" else [])
+
+
+@pytest.mark.parametrize("fail", [False, True])
+@pytest.mark.parametrize("grouped", [False, True])
+def test_local_shard_execution_preserves_step_hooks_state_and_exception_cleanup(monkeypatch, fail, grouped):
+    import sys
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from veomni.optim.hyper_optimizer import wrap_optimizer
+    from veomni.optim.lr_scheduler import build_lr_scheduler
+
+    events = []
+
+    @contextmanager
+    def dispatch_context():
+        events.append("enter")
+        try:
+            yield
+        finally:
+            events.append("exit")
+
+    monkeypatch.setitem(sys.modules, "hyper_parallel", SimpleNamespace(SkipDTensorDispatch=dispatch_context))
+    parameter = torch.nn.Parameter(torch.ones(2))
+    leaf = torch.optim.AdamW([parameter], lr=1e-3)
+    leaf.register_step_pre_hook(lambda *args: events.append("pre"))
+    leaf.register_step_post_hook(lambda *args: events.append("post"))
+
+    class Group:
+        _is_multi_optimizer = True
+        key_names = ["leaf"]
+
+        def __init__(self):
+            self.optimizers_dict = {"leaf": leaf}
+
+        def step(self):
+            return leaf.step()
+
+        def state_dict(self):
+            return {"leaf": leaf.state_dict()}
+
+    owner = Group() if grouped else leaf
+    original_step = owner.step.__func__
+    adapter = wrap_optimizer(owner)
+    assert wrap_optimizer(adapter) is adapter
+    assert owner.step.__func__ is original_step
+    scheduler = build_lr_scheduler(adapter, train_steps=4, lr=1e-3, lr_decay_style="linear")
+    if fail:
+
+        def reject_step(*args):
+            raise RuntimeError("step failed")
+
+        leaf.register_step_pre_hook(reject_step)
+        with pytest.raises(RuntimeError, match="step failed"):
+            adapter.step()
+        assert events == ["enter", "pre", "exit"]
+    else:
+        parameter.grad = torch.ones_like(parameter)
+        adapter.step()
+        scheduler.step()
+        assert events == ["enter", "pre", "post", "exit"]
+        assert leaf.param_groups[0]["lr"] < 1e-3
+        assert owner.step.__func__ is original_step if grouped else owner.step.__wrapped__ is original_step
+        assert adapter.state_dict().keys() == owner.state_dict().keys()
+        if not grouped:
+            restored = torch.optim.AdamW([torch.nn.Parameter(torch.ones(2))])
+            restored.load_state_dict(adapter.state_dict())
+            assert restored.param_groups[0]["lr"] == leaf.param_groups[0]["lr"]
+            assert restored.state_dict()["state"][0]["step"] == 1
 
 
 class _TinyModel(torch.nn.Module):

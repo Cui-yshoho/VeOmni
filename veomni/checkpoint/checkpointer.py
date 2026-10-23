@@ -27,7 +27,9 @@ CHECKPOINTER_REGISTRY = Registry("checkpointer")
 CHECKPOINT_TO_STATE_DICT_REGISTRY = Registry("checkpoint_to_state_dict")
 
 
-def build_checkpointer(ckpt_manager: str, dist_backend: str):
+def build_checkpointer(ckpt_manager: str, dist_backend: str, fsdp_backend: str = "torch"):
+    if fsdp_backend != "torch":
+        return CHECKPOINTER_REGISTRY[ckpt_manager](dist_backend, fsdp_backend=fsdp_backend)
     return CHECKPOINTER_REGISTRY[ckpt_manager](dist_backend)
 
 
@@ -107,7 +109,15 @@ class CheckpointerBase(ABC):
 
 
 @CHECKPOINTER_REGISTRY.register("dcp")
-def dcp_checkpointer(dist_backend: str):
+def dcp_checkpointer(dist_backend: str, fsdp_backend: str = "torch"):
+    if fsdp_backend == "hyper":
+        if dist_backend != "fsdp2":
+            raise ValueError("Hyper checkpointing requires dist_backend='fsdp2'.")
+        from .hyper_parallel_checkpointer import HyperParallelCheckpointer
+
+        return HyperParallelCheckpointer
+    if fsdp_backend != "torch":
+        raise ValueError(f"Unsupported FSDP backend: {fsdp_backend}")
     if dist_backend not in ["ddp", "fsdp2"]:
         raise ValueError(
             f"Unsupported distributed backend: {dist_backend} for DCP checkpoint manager, supported modes are: ddp, fsdp2"

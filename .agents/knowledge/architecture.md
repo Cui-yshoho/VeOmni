@@ -14,10 +14,13 @@ veomni/
 ├── distributed/        All parallelism strategies
 │   ├── parallel_state.py   init_parallel_state_from_config(), ParallelState, mesh setup
 │   ├── torch_parallelize.py  build_parallelize_model(), parallelize_model_fsdp2()
+│   ├── hyper_parallelize.py  Optional Hyper API resolution, wrapping/prefetch policy,
+│   │                       EP gradient scaling, reduction intervals and clipping
 │   ├── parallel_plan.py    ParallelPlan for ExtraParallel (EP, embedding shard)
 │   ├── async_offload.py    Async activation offload (SwapTensor, OffloadManager, async_save_on_cpu)
 │   ├── emb_parallel/   ShardedEmbedding: vocab rows over the emb group, all-to-all lookup, tied projection
 │   ├── fsdp2/          FSDP2 (composable fully_shard), gradient clipping
+│   │   └── backend.py Backend API factory; shared traversal stays in torch_parallelize.py
 │   ├── moe/            MoE expert parallelism: token routing, all-to-all, EPGroupGemm
 │   └── sequence_parallel/  Ulysses SP: all-to-all head/seq exchange, async variants
 ├── models/             Model loading and patching
@@ -36,6 +39,9 @@ veomni/
 │   │                   the resulting MultiOptimizer holds up to four
 │   │                   sub-optimizers: muon_<para>, muon_non_extra_parallel,
 │   │                   <para>, non_extra_parallel.
+│   ├── hyper_muon.py   Optional Hyper Muon factory, NS callback and resume validation;
+│   │                   reuses native grouping helpers and NS kernels without changing them.
+│   ├── hyper_optimizer.py  Local-shard execution adapter and Hyper DTensor layout helpers
 │   ├── muon.py         DistributedMuon: DTensor-aware Muon for 2D dense and
 │   │                   3D MoE expert weights, plus the batched_newton_schulz
 │   │                   primitive (Keller-Jordan quintic NS over the trailing

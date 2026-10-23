@@ -280,6 +280,39 @@ def test_runtime_forwards_low_precision_reduce_scatter_config(monkeypatch, enabl
     assert len(calls) == 1
     assert calls[0]["low_precision_reduce_scatter_comm"] is enabled
     assert calls[0]["mixed_precision"] is config.mixed_precision
+    assert "hyper_wrap_modules" not in calls[0]
+
+
+@pytest.mark.parametrize("interval", [1, 2])
+@pytest.mark.parametrize("backend", ["torch", "hyper"])
+def test_runtime_keeps_wrap_policy_internal(monkeypatch, backend, interval):
+    from veomni.distributed import torch_parallelize
+
+    if backend == "torch" and interval != 1:
+        with pytest.raises(ValueError, match="requires fsdp_backend"):
+            FSDPConfig(fsdp_backend=backend, hyper_reduce_comm_interval=interval)
+        return
+    config = FSDPConfig(fsdp_backend=backend, hyper_reduce_comm_interval=interval)
+    runtime = unbuilt_runtime(
+        ModelArguments(model_path="somewhere", accelerator=AcceleratorConfig(fsdp_config=config)),
+        train=train_args(),
+    )
+    runtime.model = nn.Linear(2, 2)
+    calls = []
+
+    def parallelize(model, **kwargs):
+        calls.append(kwargs)
+        return model
+
+    monkeypatch.setattr(torch_parallelize, "build_parallelize_model", parallelize)
+    runtime._build_parallelized_model()
+    assert "hyper_wrap_modules" not in calls[0]
+    assert "hyper_forward_prefetch_depth" not in calls[0]
+    assert "hyper_forward_prefetch_policy" not in calls[0]
+    if interval != 1:
+        assert calls[0]["hyper_reduce_comm_interval"] == interval
+    else:
+        assert "hyper_reduce_comm_interval" not in calls[0]
 
 
 class TestWhereTheLoaderReadsTheConfigFrom:

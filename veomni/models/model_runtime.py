@@ -392,6 +392,8 @@ class VeOmniModelRuntime:
         if bool(args.lora_config):
             kwargs["adapter_path"] = args.lora_config.get("lora_adapter", None)
             kwargs["is_peft_model"] = True
+        if args.accelerator.fsdp_config.hyper_reduce_comm_interval != 1:
+            kwargs["hyper_reduce_comm_interval"] = args.accelerator.fsdp_config.hyper_reduce_comm_interval
 
         muon_expert_zero_comm = args.optimizer.type == "muon" and args.optimizer.muon_expert_zero_comm
 
@@ -430,6 +432,7 @@ class VeOmniModelRuntime:
             max_load_broadcast_size=args.accelerator.fsdp_config.max_load_broadcast_size,
             muon_expert_zero_comm=muon_expert_zero_comm,
             low_precision_reduce_scatter_comm=args.accelerator.fsdp_config.low_precision_reduce_scatter_comm,
+            fsdp_backend=args.accelerator.fsdp_config.fsdp_backend,
             compile_config=compile_config,
             **kwargs,
         )

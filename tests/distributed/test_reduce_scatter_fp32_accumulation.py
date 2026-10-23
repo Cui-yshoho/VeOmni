@@ -1,3 +1,4 @@
+import builtins
 import copy
 import gc
 import os
@@ -411,9 +412,98 @@ def test_low_precision_rs_flag_requires_boolean(monkeypatch, value):
         torch_parallelize.parallelize_model_fsdp2(nn.Linear(2, 2), low_precision_reduce_scatter_comm=value)
 
 
+def test_fsdp_backend_factory_keeps_torch_mesh_and_lazy_imports(monkeypatch):
+    from veomni.distributed.fsdp2.backend import get_fsdp2_backend
+
+    original_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "hyper_parallel" or name.startswith("hyper_parallel."):
+            raise AssertionError("Torch FSDP backend must not import HyperParallel")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    backend = get_fsdp2_backend("torch")
+    mesh = object()
+    assert backend.to_mesh(mesh, "fsdp") is mesh
+    assert backend.weight_load_kwargs() == {}
+    with pytest.raises(ValueError, match="Unsupported fsdp_backend"):
+        get_fsdp2_backend("unknown")
+
+
 def test_low_precision_rs_flag_defaults_off_and_skips_precision_inspection():
     assert FSDPConfig().low_precision_reduce_scatter_comm is False
     assert not validate_low_precision_reduce_scatter_comm(False, object())
+
+
+@pytest.mark.parametrize("ndim", [1, 2])
+def test_hyper_backend_resolves_directly_and_reuses_existing_mesh_groups(monkeypatch, ndim):
+    from veomni.distributed import hyper_parallelize as hyper_fsdp2
+    from veomni.distributed.fsdp2.backend import FSDP2Backend, get_fsdp2_backend
+
+    captured = []
+    fake_api = SimpleNamespace(
+        DTensor=type("HyperDTensor", (), {}),
+        HSDPModule=object,
+        fully_shard=object,
+        distribute_tensor=object,
+        Shard=object,
+        CPUOffloadPolicy=object,
+        MixedPrecisionPolicy=object,
+        DeviceMesh=SimpleNamespace(from_group=lambda **kwargs: captured.append(kwargs)),
+    )
+    original_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        return (
+            fake_api
+            if (name == "hyper_parallel" or name.startswith("hyper_parallel."))
+            else original_import(name, *args, **kwargs)
+        )
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    monkeypatch.setattr(hyper_fsdp2, "_HYPER_DTENSOR_TYPE", None)
+    groups = [object() for _ in range(ndim)]
+    ranks = torch.arange(4).reshape((4,) if ndim == 1 else (2, 2))
+    mesh = SimpleNamespace(
+        mesh_dim_names=None, ndim=ndim, get_all_groups=lambda: groups, mesh=ranks, device_type="cuda"
+    )
+    hyper_fsdp2.get_hyper_fsdp2_backend.cache_clear()
+    try:
+        backend = get_fsdp2_backend("hyper")
+        assert isinstance(backend, FSDP2Backend)
+        assert get_fsdp2_backend("hyper") is backend
+        assert hyper_fsdp2.is_hyper_dtensor(fake_api.DTensor())
+        backend.to_mesh(mesh, "fsdp")
+        assert captured == [
+            dict(
+                group=groups[0] if ndim == 1 else groups,
+                device_type="cuda",
+                mesh=ranks.tolist(),
+                mesh_dim_names=tuple(f"fsdp_{i}" for i in range(ndim)),
+            )
+        ]
+        assert backend.weight_load_kwargs() == {"dtensor_factory": fake_api.distribute_tensor}
+    finally:
+        hyper_fsdp2.get_hyper_fsdp2_backend.cache_clear()
+
+
+def test_hyper_backend_missing_dependency_fails_only_after_selection(monkeypatch):
+    from veomni.distributed import hyper_parallelize as hyper_fsdp2
+    from veomni.distributed.fsdp2.backend import get_fsdp2_backend
+
+    original_import = builtins.__import__
+
+    def missing_import(name, *args, **kwargs):
+        if name == "hyper_parallel" or name.startswith("hyper_parallel."):
+            raise ImportError("optional dependency missing")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", missing_import)
+    hyper_fsdp2.get_hyper_fsdp2_backend.cache_clear()
+    assert get_fsdp2_backend("torch").name == "torch"
+    with pytest.raises(RuntimeError, match="requires the optional"):
+        get_fsdp2_backend("hyper")
 
 
 @pytest.mark.parametrize("dp_mode", ["ddp", "eager"])
@@ -543,7 +633,7 @@ def test_matching_transport_round_trip_preserves_all_finite_16bit_values(dtype):
 def mock_fsdp_builder(monkeypatch):
     state = SimpleNamespace(any_extra_parallel_enabled=False, extra_parallel_names=[], fsdp_mesh=None)
     monkeypatch.setattr(torch_parallelize, "get_parallel_state", lambda: state)
-    monkeypatch.setattr(torch_parallelize, "fully_shard", lambda *args, **kwargs: None)
+    monkeypatch.setattr("torch.distributed._composable.fsdp.fully_shard", lambda *args, **kwargs: None)
     monkeypatch.setattr(torch_parallelize, "_materialize_and_load_weights", lambda *args, **kwargs: None)
     return state
 
@@ -704,7 +794,7 @@ def test_parallelize_checks_dense_and_expert_meshes_independently(
     monkeypatch.setattr(torch_parallelize, "get_runtime_parallel_plan", lambda model: FakePlan())
     monkeypatch.setattr(torch_parallelize, "ReduceScatterTransportPolicy", FakeTransportPolicy)
     monkeypatch.setattr(device_utils, "IS_CUDA_AVAILABLE", True)
-    monkeypatch.setattr(torch_parallelize, "fully_shard", record_wrap)
+    monkeypatch.setattr("torch.distributed._composable.fsdp.fully_shard", record_wrap)
     monkeypatch.setattr(
         torch_parallelize, "register_fp32_reduce_scatter_with_low_precision_transport", record_registration
     )

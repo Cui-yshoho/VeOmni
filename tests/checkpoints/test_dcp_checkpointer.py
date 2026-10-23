@@ -32,6 +32,126 @@ from veomni.trainer.callbacks.base import TrainerState
 from veomni.utils.checkpoint_utils import should_skip_hf_weight_load
 
 
+def test_checkpoint_backend_selection_uses_registered_factory(monkeypatch):
+    from veomni.checkpoint.checkpointer import CHECKPOINTER_REGISTRY, build_checkpointer
+
+    calls = []
+    sentinel = object()
+
+    def factory(mode, **kwargs):
+        calls.append((mode, kwargs))
+        return sentinel
+
+    monkeypatch.setitem(CHECKPOINTER_REGISTRY, "dcp", factory)
+    assert build_checkpointer("dcp", "fsdp2") is sentinel
+    assert build_checkpointer("dcp", "fsdp2", fsdp_backend="hyper") is sentinel
+    assert calls == [("fsdp2", {}), ("fsdp2", {"fsdp_backend": "hyper"})]
+
+
+@pytest.mark.parametrize("updated", [False, True])
+def test_hyper_checkpoint_empty_optimizer_keeps_save_sequence_and_roundtrips(tmp_path, monkeypatch, updated):
+    import copy
+
+    from veomni.checkpoint import hyper_parallel_checkpointer as checkpoint
+
+    payloads, save_calls = {}, []
+
+    def save(payload, checkpoint_id, use_collectives):
+        assert use_collectives is False
+        save_calls.append(Path(checkpoint_id).name)
+        payloads[checkpoint_id] = copy.deepcopy(payload)
+
+    def load(payload, checkpoint_id, use_collectives):
+        assert use_collectives is False
+        for key, value in copy.deepcopy(payloads[checkpoint_id]).items():
+            if isinstance(value, dict):
+                payload[key].clear()
+                payload[key].update(value)
+            else:
+                payload[key] = value
+
+    monkeypatch.setattr(checkpoint, "_checkpoint_api", lambda: (save, load))
+    monkeypatch.setattr(checkpoint, "_topology_signature", lambda *args: {"world_size": 1})
+    model = nn.Linear(2, 2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    if updated:
+        model(torch.ones(1, 2)).sum().backward()
+        optimizer.step()
+    expected_model = copy.deepcopy(model.state_dict())
+    expected_optimizer = copy.deepcopy(optimizer.state_dict())
+    checkpoint.HyperParallelCheckpointer.save(str(tmp_path), {"model": model, "optimizer": optimizer})
+
+    # Hyper save may barrier even with use_collectives=False. All ranks must
+    # enter the same three saves, including ranks without optimizer tensors.
+    assert save_calls == ["optimizer_manifest", "optimizer", "ckpt"]
+    assert bool(payloads[str(tmp_path / "model" / "optimizer")]["tensors"]) is updated
+    if not updated:
+        # Empty-state checkpoints written before the fix have no tensor component.
+        del payloads[str(tmp_path / "model" / "optimizer")]
+
+    restored_model = nn.Linear(2, 2)
+    restored_optimizer = torch.optim.AdamW(restored_model.parameters(), lr=0.02)
+    checkpoint.HyperParallelCheckpointer.load(
+        str(tmp_path), {"model": restored_model, "optimizer": restored_optimizer}
+    )
+    torch.testing.assert_close(restored_model.state_dict(), expected_model)
+    torch.testing.assert_close(restored_optimizer.state_dict(), expected_optimizer)
+
+
+def _hyper_checkpoint_empty_owner_worker(rank, checkpoint_root):
+    import copy
+    from datetime import timedelta
+
+    from veomni.checkpoint.hyper_parallel_checkpointer import HyperParallelCheckpointer
+
+    root = Path(checkpoint_root)
+    dist.init_process_group(
+        "gloo", init_method=f"file://{root / 'rendezvous'}", rank=rank, world_size=2, timeout=timedelta(seconds=30)
+    )
+    try:
+        parallel_state = SimpleNamespace(
+            dp_replicate_size=1,
+            dp_shard_size=2,
+            tp_size=1,
+            pp_size=1,
+            cp_size=1,
+            ulysses_size=1,
+            extra_parallel_sizes={},
+            extra_parallel_names=(),
+            device_mesh=None,
+        )
+        torch.manual_seed(42 + rank)
+        model = nn.Linear(2, 2)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+        if rank == 0:
+            model(torch.ones(1, 2)).sum().backward()
+            optimizer.step()
+        expected_model = copy.deepcopy(model.state_dict())
+        expected_optimizer = copy.deepcopy(optimizer.state_dict())
+        path = str(root / "checkpoint")
+        HyperParallelCheckpointer.save(path, {"model": model, "optimizer": optimizer}, parallel_state=parallel_state)
+        assert (root / "checkpoint" / "model" / "optimizer" / f"{rank}.metadata").is_file()
+        restored_model = nn.Linear(2, 2)
+        restored_optimizer = torch.optim.AdamW(restored_model.parameters(), lr=0.02)
+        HyperParallelCheckpointer.load(
+            path, {"model": restored_model, "optimizer": restored_optimizer}, parallel_state=parallel_state
+        )
+        torch.testing.assert_close(restored_model.state_dict(), expected_model)
+        torch.testing.assert_close(restored_optimizer.state_dict(), expected_optimizer)
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+def test_hyper_checkpoint_empty_owner_gloo_roundtrip(tmp_path, monkeypatch):
+    import importlib.util
+
+    if importlib.util.find_spec("hyper_parallel") is None or not dist.is_gloo_available():
+        pytest.skip("requires optional HyperParallel and CPU Gloo")
+    monkeypatch.setenv("HYPER_PARALLEL_PLATFORM", "torch")
+    mp.spawn(_hyper_checkpoint_empty_owner_worker, args=(str(tmp_path),), nprocs=2, join=True)
+
+
 def _fsdp2_multi_optimizer_worker(rank: int, world_size: int, tmp_path: Path):
     """Worker for the FSDP2 MultiOptimizer DCP round-trip test."""
     from veomni.checkpoint.dcp_checkpointer import ModelState, OptimizerState
@@ -528,7 +648,7 @@ class TestSkipHfWeightLoadOnResume:
         assert not resumed.scale.is_meta
         parallel_state = SimpleNamespace(any_extra_parallel_enabled=False, extra_parallel_names=[], fsdp_mesh=None)
         monkeypatch.setattr(torch_parallelize, "get_parallel_state", lambda: parallel_state)
-        monkeypatch.setattr(torch_parallelize, "fully_shard", lambda *args, **kwargs: None)
+        monkeypatch.setattr("torch.distributed._composable.fsdp.fully_shard", lambda *args, **kwargs: None)
         monkeypatch.setattr(torch_parallelize, "get_device_type", lambda: "cpu")
 
         resumed = parallelize_model_fsdp2(
@@ -597,7 +717,7 @@ class TestMaterializeAndLoadDispatch:
             "get_parallel_state",
             lambda: SimpleNamespace(any_extra_parallel_enabled=False, extra_parallel_names=[], fsdp_mesh=None),
         )
-        monkeypatch.setattr(torch_parallelize, "fully_shard", lambda *args, **kwargs: None)
+        monkeypatch.setattr("torch.distributed._composable.fsdp.fully_shard", lambda *args, **kwargs: None)
         monkeypatch.setattr(torch_parallelize, "get_device_type", lambda: "cpu")
 
         parallelize_model_fsdp2(

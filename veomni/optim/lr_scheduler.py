@@ -65,12 +65,20 @@ def build_lr_scheduler(
     lr_min: float = 1e-7,
     lr_start: float = 0.0,
 ):
+    # Execution adapters leave scheduler state and step tracking on the owner.
+    optimizer = getattr(optimizer, "_scheduler_optimizer", optimizer)
     # Handle MultiOptimizer by creating one scheduler per underlying optimizer
     if hasattr(optimizer, "_is_multi_optimizer") or isinstance(optimizer, dict):
+        optimizers_dict = optimizer if isinstance(optimizer, dict) else optimizer.optimizers_dict
+        key_names = getattr(optimizer, "key_names", None)
+        if key_names is None:
+            key_names = getattr(optimizer, "optimizers_keys", None)
+        if key_names is None:
+            key_names = list(optimizers_dict)
         schedulers = {}
-        for key_name in optimizer.key_names:
+        for key_name in key_names:
             schedulers[key_name] = build_lr_scheduler(
-                optimizer=optimizer.optimizers_dict[key_name],
+                optimizer=optimizers_dict[key_name],
                 train_steps=train_steps,
                 lr=lr,
                 lr_decay_style=lr_decay_style,
