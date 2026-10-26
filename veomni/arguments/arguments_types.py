@@ -247,8 +247,14 @@ class OptimizerConfig:
             )
         },
     )
+    use_hyper_optimizer: bool = field(
+        default=False,
+        metadata={"help": "Use the optional HyperParallel Muon implementation."},
+    )
 
     def __post_init__(self):
+        if self.use_hyper_optimizer and self.type != "muon":
+            raise ValueError("use_hyper_optimizer=True requires optimizer type='muon'.")
         if self.grad_clip_scope == "global":
             raise NotImplementedError(
                 "model.optimizer.grad_clip_scope='global' needs a clip that spans several "
@@ -612,6 +618,14 @@ class FSDPConfig:
         },
     )
     mixed_precision: MixedPrecisionConfig = field(default_factory=MixedPrecisionConfig)
+    fsdp_backend: Literal["torch", "hyper"] = field(
+        default="torch",
+        metadata={"help": "FSDP2 implementation backend."},
+    )
+    hyper_reduce_comm_interval: int = field(
+        default=1,
+        metadata={"help": "Hyper FSDP units between gradient reduction submission and waiting."},
+    )
 
     def __post_init__(self):
         if self.fsdp_mode not in ("ddp", "fsdp2", "eager"):
@@ -625,6 +639,14 @@ class FSDPConfig:
         validate_low_precision_reduce_scatter_comm(
             self.low_precision_reduce_scatter_comm, self.mixed_precision, fsdp_mode=self.fsdp_mode
         )
+        if self.fsdp_backend not in ("torch", "hyper"):
+            raise ValueError(f"Unsupported fsdp_backend={self.fsdp_backend!r}; expected 'torch' or 'hyper'.")
+        if self.fsdp_mode != "fsdp2" and self.fsdp_backend != "torch":
+            raise ValueError("fsdp_backend='hyper' requires fsdp_mode='fsdp2'.")
+        if type(self.hyper_reduce_comm_interval) is not int or self.hyper_reduce_comm_interval < 1:
+            raise ValueError("hyper_reduce_comm_interval must be a positive integer.")
+        if self.hyper_reduce_comm_interval != 1 and self.fsdp_backend != "hyper":
+            raise ValueError("hyper_reduce_comm_interval > 1 requires fsdp_backend='hyper'.")
 
 
 @dataclass
@@ -1779,6 +1801,13 @@ class ModelArguments(BaseModelArguments):
     )
     accelerator: AcceleratorConfig = field(default_factory=AcceleratorConfig)
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
+
+    @property
+    def use_hyper_parallel(self) -> bool:
+        """Whether this model selects Hyper FSDP or Hyper Muon."""
+        return self.accelerator.fsdp_config.fsdp_backend == "hyper" or bool(
+            getattr(self.optimizer, "use_hyper_optimizer", False)
+        )
 
     def __post_init__(self):
         super().__post_init__()

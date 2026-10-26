@@ -73,6 +73,16 @@ class OmniModelRuntimeArguments(ModelArguments):
         return list(self.modules)
 
     @property
+    def use_hyper_parallel(self) -> bool:
+        """Whether any resolved module selects Hyper FSDP or Hyper Muon."""
+        model_scope = self.accelerator.fsdp_config.fsdp_scope == "model"
+        return any(
+            (self.accelerator if model_scope else module.accelerator).fsdp_config.fsdp_backend == "hyper"
+            or getattr(module.optimizer, "use_hyper_optimizer", False)
+            for module in self.modules.values()
+        )
+
+    @property
     def train_types(self) -> list[str]:
         return list(self.training_graphs)
 

@@ -62,6 +62,7 @@ MANIFEST_FORMAT_VERSION = 1
 # is one per DCP directory, nested inside ``model/``; the step root never has
 # one. Under an async save it is what separates "handed over" from "on disk".
 DCP_MARKER_FILENAME = ".metadata"
+HYPER_MARKER_FILENAME = ".hyper_complete"
 
 
 def step_dir(save_path: str, global_step: int) -> str:
@@ -250,7 +251,15 @@ def checkpoint_is_complete(step_root: str) -> bool:
     manifest = read_manifest(step_root)
     if manifest is None:
         return False
-    return all(os.path.exists(path) for path in dcp_markers(step_root, discover_modules(step_root)))
+    modules = discover_modules(step_root)
+    for module in modules:
+        # HyperParallel owns its checkpoint format and publishes one marker only
+        # after weights, optimizer and model-bound extra state have all landed.
+        if os.path.exists(os.path.join(model_dir(step_root, module), HYPER_MARKER_FILENAME)):
+            continue
+        if not all(os.path.exists(path) for path in dcp_markers(step_root, [module])):
+            return False
+    return True
 
 
 __all__ = [
@@ -258,6 +267,7 @@ __all__ = [
     "DCP_MARKER_FILENAME",
     "EXTRA_STATE_DIRNAME",
     "HF_EXPORT_DIRNAME",
+    "HYPER_MARKER_FILENAME",
     "LORA_EXPORT_DIRNAME",
     "LOADER_DIRNAME",
     "LR_SCHEDULER_FILENAME",

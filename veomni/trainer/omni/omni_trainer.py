@@ -264,7 +264,13 @@ class OmniTrainer:
 
     def _build_model_runtime(self) -> OmniModelRuntime:
         """Build the composed model — every module built, wrapped and given its optimizer."""
-        model = build_omni_model_runtime(build_omni_model_runtime_args(self.args), train=self.args.train)
+        runtime_args = build_omni_model_runtime_args(self.args)
+        if runtime_args.use_hyper_parallel:
+            from ...hyper_parallel.model_runtime import build_hyper_omni_model_runtime
+
+            model = build_hyper_omni_model_runtime(runtime_args, train=self.args.train)
+        else:
+            model = build_omni_model_runtime(runtime_args, train=self.args.train)
         if model.optimizer is None:
             raise ValueError("OmniTrainer has nothing to train: every module is frozen.")
         return model
