@@ -260,6 +260,10 @@ class TextDPOTrainer:
 
     def _build_policy_model_runtime(self) -> VeOmniModelRuntime:
         """Build the trainable policy under ParallelState ``"policy"``."""
+        if self.base.args.model.use_hyper_parallel:
+            from ..hyper_parallel.model_runtime import text_runtime
+
+            return text_runtime(self.base.args.model, "policy", train=self.base.args.train)
         return self.base._build_model_runtime(model_name="policy")
 
     def _build_reference_model_runtime(self) -> DPOReferenceModelRuntime:
@@ -269,6 +273,12 @@ class TextDPOTrainer:
         is not supported.
         """
         args: VeOmniDPOArguments = self.base.args
+        if args.model.use_hyper_parallel:
+            from ..hyper_parallel.model_runtime import reference_runtime
+
+            return reference_runtime(
+                args.model, "reference", train=args.train, torch_dtype=args.dpo_config.refer_model_precision
+            )
         return DPOReferenceModelRuntime(
             args.model,
             "reference",

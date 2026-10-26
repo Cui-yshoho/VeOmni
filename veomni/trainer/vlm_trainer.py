@@ -237,6 +237,10 @@ class VLMTrainer:
 
     def _build_model_runtime(self) -> VLMModelRuntime:
         """Build (and own) this job's VLM. Override to swap in another runtime."""
+        if self.base.args.model.use_hyper_parallel:
+            from ..hyper_parallel.model_runtime import vlm_runtime
+
+            return vlm_runtime(self.base.args.model, "base", train=self.base.args.train)
         return VLMModelRuntime(
             self.base.args.model,
             "base",

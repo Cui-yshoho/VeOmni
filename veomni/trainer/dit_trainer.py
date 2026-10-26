@@ -354,6 +354,10 @@ class DiTTrainer:
 
     def _build_model_runtime(self) -> DiTModelRuntime:
         """Build (and own) this job's DiT. Override to swap in another runtime."""
+        if self.base.args.model.use_hyper_parallel:
+            from ..hyper_parallel.model_runtime import dit_runtime
+
+            return dit_runtime(self.base.args.model, "base", train=self.base.args.train)
         return DiTModelRuntime(self.base.args.model, "base", train=self.base.args.train)
 
     def _setup(self):

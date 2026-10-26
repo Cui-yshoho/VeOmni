@@ -18,6 +18,38 @@ def _skip_if_unsupported():
         pytest.skip("Triton fused MoE is not available in this environment.")
 
 
+def test_merged_expert_wgrad_writes_unrounded_fp32():
+    """BF16 inputs can produce FP32 expert gradients without BF16 rounding."""
+    _skip_if_unsupported()
+    from veomni.ops.kernels.moe.group_gemm import MergedFc1TritonFusedMoeExpertFunction
+
+    torch.manual_seed(14)
+    device = torch.device(get_device_type())
+    num_tokens, num_experts, hidden, intermediate, topk = 64, 4, 64, 32, 2
+    x = torch.randn(num_tokens, hidden, device=device, dtype=torch.bfloat16) * 0.1
+    gate, indices = torch.topk(torch.rand(num_tokens, num_experts, device=device), topk, dim=-1)
+    gate = gate.to(torch.bfloat16)
+    fc1 = torch.randn(num_experts, 2 * intermediate, hidden, device=device, dtype=torch.bfloat16) * 0.1
+    fc2 = torch.randn(num_experts, hidden, intermediate, device=device, dtype=torch.bfloat16) * 0.1
+    if not hasattr(fc1, "grad_dtype"):
+        pytest.skip("PyTorch does not support Tensor.grad_dtype")
+
+    results = []
+    for grad_dtype in (torch.bfloat16, torch.float32):
+        w1 = torch.nn.Parameter(fc1.clone())
+        w2 = torch.nn.Parameter(fc2.clone())
+        w1.grad_dtype = grad_dtype
+        w2.grad_dtype = grad_dtype
+        out = MergedFc1TritonFusedMoeExpertFunction.apply(num_experts, gate, indices, x, w1, w2)
+        out.float().sum().backward()
+        assert w1.grad.dtype == grad_dtype and w2.grad.dtype == grad_dtype
+        results.append((w1.grad, w2.grad))
+
+    for bf16_grad, fp32_grad in zip(*results):
+        torch.testing.assert_close(fp32_grad, bf16_grad.float(), rtol=3e-2, atol=1e-3)
+        assert torch.any(fp32_grad != fp32_grad.to(torch.bfloat16).float())
+
+
 def _eager_moe_forward(
     num_experts: int,
     routing_weights: torch.Tensor,

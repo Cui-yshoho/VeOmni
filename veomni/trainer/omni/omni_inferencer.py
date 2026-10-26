@@ -134,10 +134,12 @@ class OmniInferencer:
         """
         self.module_names = self.omni_model_runtime.module_names
         if self._distributed:
-            self.model = build_omni_model_runtime(
-                self.omni_model_runtime,
-                for_inference=True,
-            )
+            if self.omni_model_runtime.use_hyper_parallel:
+                from ...hyper_parallel.model_runtime import build_hyper_omni_model_runtime
+
+                self.model = build_hyper_omni_model_runtime(self.omni_model_runtime, for_inference=True)
+            else:
+                self.model = build_omni_model_runtime(self.omni_model_runtime, for_inference=True)
         else:
             config = self.omni_model_runtime.to_hf_config()
             config.load_checkpoint_sidecars(self.checkpoint_root)

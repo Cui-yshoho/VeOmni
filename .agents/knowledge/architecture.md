@@ -20,6 +20,11 @@ veomni/
 │   ├── fsdp2/          FSDP2 (composable fully_shard), gradient clipping
 │   ├── moe/            MoE expert parallelism: token routing, all-to-all, EPGroupGemm
 │   └── sequence_parallel/  Ulysses SP: all-to-all head/seq exchange, async variants
+├── hyper_parallel/     Optional VeOmni-owned training/runtime integration
+│   ├── __init__.py     Opt-in predicate and Hyper resume discovery; no Hyper import
+│   ├── model_runtime.py  Native lifecycle subclasses and Text/Omni construction
+│   ├── checkpoint.py   Native managers, explicit DCP selection and checkpoint-only layout views
+│   └── train.py        Native parsers and task selection
 ├── models/             Model loading and patching
 │   ├── auto.py         High-level API: build_foundation_model, build_tokenizer, build_processor
 │   ├── loader.py       Registry-based model loading (MODELING_REGISTRY, MODEL_CONFIG_REGISTRY)
@@ -30,7 +35,7 @@ veomni/
 │   ├── transformers/   Per-model patches (one subpackage per model family)
 │   └── diffusers/      Diffusion model families (Wan, LTX, Qwen-Image)
 ├── optim/              Optimizer and LR scheduler construction
-│   ├── optimizer.py    build_optimizer() factory + MultiOptimizer wrapper.
+│   ├── optimizer.py    Native optimizer construction + MultiOptimizer wrapper.
 │   │                   For optimizer.type=="muon" splits params Muon vs AdamW
 │   │                   and (under FSDP+EP) further by ExtraParallel mesh, so
 │   │                   the resulting MultiOptimizer holds up to four
@@ -172,6 +177,40 @@ Those cursor files are written **per rank**, where V2 writes a single rank-0 `tr
 - `training_loop()` -> main loop with callbacks
 
 Subclasses override specific methods (e.g., `compute_loss()`, custom data transforms) rather than the entire training loop. Note that `TextTrainer`, `VLMTrainer`, `DiTTrainer` and `TextDPOTrainer` *compose* a `BaseTrainer` in `self.base` rather than subclassing it, and drive the build steps one at a time (constraint 24).
+
+Public trainer constructors keep their native signatures. Text, VLM, DiT, DPO
+and Omni select Hyper lazily at their existing runtime construction sites;
+native branches retain their original calls. All original task scripts honor
+the same Hyper flags. The optional
+`python -m veomni.hyper_parallel.train <task> config.yaml` launcher constructs
+the same native trainer classes, without extra trainer subclasses.
+Text reads the configuration-only ModelArguments.use_hyper_parallel property;
+Omni overrides the same property for multi-module scope and optimizer selection.
+Omni explicitly calls build_hyper_omni_model_runtime at
+its existing training/distributed-inference call sites, with branch-local
+imports. Native Omni builders keep names, signatures and bodies; no factory
+parameters or extra inference method are added. Omni's configuration-only
+`OmniModelRuntimeArguments.use_hyper_parallel` property centralizes scope and independent
+Muon selection for both call sites without importing Hyper. No config field is added.
+VeOmni owns runtime subclasses, trainer selection, model/Omni composition and
+checkpoint managers in its optional `hyper_parallel` directory. Native model
+building, training loops, data and callbacks stay in VeOmni; runtime methods
+lazily call the external `hyper_parallel.integration.veomni` execution adapter
+for parallelization, loading, optimizer/Muon, clipping and low-level DCP protocol.
+The external adapter has no trainer/runtime/manager ownership. Hyper core/root
+does not import the adapter. VeOmni composition reuses native config/LoRA
+validation, child construction and modality lifecycles. Construction introduces no global patch,
+registry framework or model/forward mutation. The existing reentrant checkpoint
+global replacement in parallelization is unchanged, as in native VeOmni; see
+`docs/key_features/fsdp2_backends.md` for that execution-side limitation.
+
+Checkpoint selection is independent of FSDP: existing `manager='dcp'` remains
+native by default. Hyper layouts use checkpoint-only Torch DTensor views under
+native DCP; `manager='hyper'` explicitly selects the separate Hyper DCP protocol.
+Native checkpoint implementation and layout files remain unchanged. The optional
+adapter wraps save payloads at `execute_save` and reuses native readers/planners
+for loading. Explicit Hyper auto-resume resolves during CheckpointConfig
+construction, before the native TrainingArguments/Omni resolver runs.
 
 **Parallel-state scoping**: `BaseTrainer._setup(args)` registers `"base"` via `init_parallel_state_from_config` before seed/determinism — it is a staticmethod because everything it does is job-level and runs before any model exists. A model then derives its own mesh in `VeOmniModelRuntime.setup()`; `VeOmniModelRuntime.__init__` scopes the mesh-dependent build to that mesh, so the trainer's remaining build steps need no scope of their own. Run time is **per-op**: `forward_backward_step` wraps `use_parallel_state(self.model.parallel_state)` around forward, postforward, and backward so none of them hard-code `"base"` (DPO wraps policy vs reference itself). `clip_grad_norm()` still wraps itself. The `parallel_state` property is a by-name registry lookup, never a stored state object, so the registry stays the single source of truth. See `.agents/knowledge/constraints.md` §7 and `docs/design/local_parallel_state.md`.
 

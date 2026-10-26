@@ -247,8 +247,45 @@ class OptimizerConfig:
             )
         },
     )
+    use_hyper_optimizer: bool = field(
+        default=False,
+        metadata={"help": "Use the optional HyperParallel Muon implementation."},
+    )
+    hyper_muon_fsdp_overlap: bool = field(
+        default=False, metadata={"help": "Pipeline Hyper Muon FSDP communication and NS."}
+    )
+    hyper_muon_fsdp_overlap_memory_budget_bytes: Optional[int] = field(
+        default=None, metadata={"help": "Temporary-memory budget for Hyper Muon communication buckets."}
+    )
+    hyper_muon_momentum_mode: Literal["legacy", "vanilla"] = field(
+        default="legacy", metadata={"help": "Hyper Muon momentum formula: legacy or opt-in EMA (vanilla)."}
+    )
+    hyper_muon_hsdp_replicate_dedup: bool = field(
+        default=True, metadata={"help": "Deduplicate Hyper Muon updates and state across HSDP replicas."}
+    )
+    hyper_muon_ns_backend: Literal["veomni", "native", "gram"] = field(
+        default="veomni",
+        metadata={"help": "Hyper Muon NS: existing VeOmni dispatch, Hyper native, or optional Hyper Gram."},
+    )
 
     def __post_init__(self):
+        if self.use_hyper_optimizer and self.type != "muon":
+            raise ValueError("use_hyper_optimizer=True requires optimizer type='muon'.")
+        if self.hyper_muon_ns_backend not in ("veomni", "native", "gram"):
+            raise ValueError("hyper_muon_ns_backend must be veomni, native or gram.")
+        if self.hyper_muon_momentum_mode not in ("legacy", "vanilla"):
+            raise ValueError("hyper_muon_momentum_mode must be legacy or vanilla.")
+        budget = self.hyper_muon_fsdp_overlap_memory_budget_bytes
+        if budget is not None and (type(budget) is not int or budget <= 0):
+            raise ValueError("hyper_muon_fsdp_overlap_memory_budget_bytes must be a positive integer.")
+        if not self.use_hyper_optimizer and (
+            self.hyper_muon_fsdp_overlap
+            or budget is not None
+            or self.hyper_muon_momentum_mode != "legacy"
+            or not self.hyper_muon_hsdp_replicate_dedup
+            or self.hyper_muon_ns_backend != "veomni"
+        ):
+            raise ValueError("Hyper Muon options require use_hyper_optimizer=True.")
         if self.grad_clip_scope == "global":
             raise NotImplementedError(
                 "model.optimizer.grad_clip_scope='global' needs a clip that spans several "
@@ -612,6 +649,17 @@ class FSDPConfig:
         },
     )
     mixed_precision: MixedPrecisionConfig = field(default_factory=MixedPrecisionConfig)
+    fsdp_backend: Literal["torch", "hyper"] = field(
+        default="torch",
+        metadata={"help": "FSDP2 implementation backend."},
+    )
+    hyper_reduce_comm_interval: int = field(
+        default=1,
+        metadata={"help": "Hyper FSDP units between gradient reduction submission and waiting."},
+    )
+    hyper_expert_grad_dtype_fp32: bool = field(
+        default=False, metadata={"help": "Write CUDA Qwen3-MoE Triton expert gradients directly in FP32 (Hyper FSDP)."}
+    )
 
     def __post_init__(self):
         if self.fsdp_mode not in ("ddp", "fsdp2", "eager"):
@@ -625,6 +673,21 @@ class FSDPConfig:
         validate_low_precision_reduce_scatter_comm(
             self.low_precision_reduce_scatter_comm, self.mixed_precision, fsdp_mode=self.fsdp_mode
         )
+        if self.fsdp_backend not in ("torch", "hyper"):
+            raise ValueError(f"Unsupported fsdp_backend={self.fsdp_backend!r}; expected 'torch' or 'hyper'.")
+        if self.fsdp_mode != "fsdp2" and self.fsdp_backend != "torch":
+            raise ValueError("fsdp_backend='hyper' requires fsdp_mode='fsdp2'.")
+        if type(self.hyper_reduce_comm_interval) is not int or self.hyper_reduce_comm_interval < 1:
+            raise ValueError("hyper_reduce_comm_interval must be a positive integer.")
+        if self.hyper_reduce_comm_interval != 1 and self.fsdp_backend != "hyper":
+            raise ValueError("hyper_reduce_comm_interval > 1 requires fsdp_backend='hyper'.")
+        if self.hyper_expert_grad_dtype_fp32:
+            if self.fsdp_backend != "hyper" or self.fsdp_mode != "fsdp2":
+                raise ValueError("hyper_expert_grad_dtype_fp32 requires Hyper FSDP2.")
+            if not self.mixed_precision.enable or self.mixed_precision.param_dtype != "bfloat16":
+                raise ValueError("hyper_expert_grad_dtype_fp32 requires BF16 mixed precision parameters.")
+            if self.mixed_precision.reduce_dtype != "float32":
+                raise ValueError("hyper_expert_grad_dtype_fp32 requires FP32 gradient reduction.")
 
 
 @dataclass
@@ -846,7 +909,7 @@ class CheckpointConfig:
     )
     manager: str = field(
         default="dcp",
-        metadata={"help": "Checkpoint manager."},
+        metadata={"help": "Checkpoint manager: 'dcp' uses native VeOmni DCP; 'hyper' explicitly selects Hyper DCP."},
     )
     save_async: bool = field(
         default=False,
@@ -939,6 +1002,11 @@ class CheckpointConfig:
                 "stage_dir cannot be combined with save_async: the staged copy is dropped when the save "
                 "returns, which an in-flight write would then be reading from."
             )
+
+        if self.manager == "hyper" and self.load_path == "auto":
+            from ..hyper_parallel import _hyper_checkpoint_path
+
+            self.load_path = _hyper_checkpoint_path(self.output_dir)
 
         if self.save_timeout_seconds is None:
             return
@@ -1779,6 +1847,13 @@ class ModelArguments(BaseModelArguments):
     )
     accelerator: AcceleratorConfig = field(default_factory=AcceleratorConfig)
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
+
+    @property
+    def use_hyper_parallel(self) -> bool:
+        """Whether this model selects Hyper FSDP or Hyper Muon."""
+        return self.accelerator.fsdp_config.fsdp_backend == "hyper" or bool(
+            getattr(self.optimizer, "use_hyper_optimizer", False)
+        )
 
     def __post_init__(self):
         super().__post_init__()

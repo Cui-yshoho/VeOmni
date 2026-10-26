@@ -42,7 +42,12 @@ class TextTrainer:
         self.base.args = args
 
         self.base.device = self.base._setup(args)  # registers ParallelState("base") before seed
-        self.base.model = self.base._build_model_runtime()
+        if args.model.use_hyper_parallel:
+            from ..hyper_parallel.model_runtime import text_runtime
+
+            self.base.model = text_runtime(args.model, "base", train=args.train)
+        else:
+            self.base.model = self.base._build_model_runtime()
 
         with use_parallel_state(self.base.model.parallel_state):
             # rewrite build_data_transform to support conversation dataset

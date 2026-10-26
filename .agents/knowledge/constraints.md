@@ -164,6 +164,9 @@ Core files:
 
 17. **Checkpoint save/load requires all ranks to participate**
     - DCP operations are collective — all ranks must call save/load simultaneously.
+    - Hyper DCP `save(..., use_collectives=False)` can still end in a global
+      barrier. Never skip an optimizer-component save based on rank-local
+      tensor count; empty-owner ranks must enter the same save sequence.
     - Calling checkpoint operations from only rank 0 causes deadlocks.
     - ``lr_scheduler.pt`` is replicated: rank 0 writes the file, but every rank
       still joins the save reduction and the promotion collectives. The sidecar

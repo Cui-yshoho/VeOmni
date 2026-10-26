@@ -7,6 +7,7 @@ in-tree bugs — they become regression guards once the fix lands.
 """
 
 import inspect
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,6 +31,146 @@ from veomni.distributed.torch_parallelize import (
 from veomni.models.module_utils import init_empty_weights
 from veomni.trainer.callbacks.base import TrainerState
 from veomni.utils.checkpoint_utils import should_skip_hf_weight_load
+
+
+class TestCheckpointStateAdapter:
+    """Hyper payload conversion stays outside native checkpoint implementations."""
+
+    def test_native_has_no_hyper_state_hook(self):
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        assert not hasattr(DistributedCheckpointer, "_adapt_state")
+
+    def test_optional_layout_bridge_inherits_orchestration(self):
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+        from veomni.hyper_parallel.checkpoint import NativeHyperCheckpointer
+
+        for name in ("save", "wait_for_pending_save"):
+            assert getattr(NativeHyperCheckpointer, name).__func__ is getattr(DistributedCheckpointer, name).__func__
+
+    @pytest.mark.parametrize("with_optimizer", [False, True])
+    def test_save_adapts_each_payload_once(self, tmp_path, with_optimizer):
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer, ModelState, OptimizerState
+        from veomni.hyper_parallel.checkpoint import NativeHyperCheckpointer
+
+        adapted = []
+
+        def adapt(state):
+            result = SimpleNamespace(wrapped=state)
+            adapted.append(result)
+            return result
+
+        state = {"model": nn.Linear(2, 2)}
+        if with_optimizer:
+            state["optimizer"] = torch.optim.AdamW(state["model"].parameters())
+        with (
+            patch.object(DistributedCheckpointer, "execute_save") as save,
+            patch.object(NativeHyperCheckpointer, "_save_extra_state"),
+            patch.object(NativeHyperCheckpointer, "_create_storage_writer"),
+            patch("veomni.hyper_parallel.checkpoint._NativeState", side_effect=adapt),
+        ):
+            NativeHyperCheckpointer.save(str(tmp_path), state, module="text", save_async=True)
+        assert isinstance(adapted[0].wrapped, ModelState)
+        assert len(adapted) == (2 if with_optimizer else 1)
+        if with_optimizer:
+            assert isinstance(adapted[1].wrapped, OptimizerState)
+        payloads = [next(iter(call.kwargs["save_state"].values())) for call in save.call_args_list]
+        assert payloads == adapted
+        assert all(call.kwargs["save_async"] for call in save.call_args_list)
+
+    @pytest.mark.parametrize("legacy", [False, True])
+    @pytest.mark.parametrize("with_optimizer", [False, True])
+    @pytest.mark.parametrize("trainable_only", [False, True])
+    def test_load_adapts_both_formats(self, tmp_path, legacy, with_optimizer, trainable_only):
+        from veomni.checkpoint.dcp_checkpointer import ModelState, OptimizerState
+        from veomni.checkpoint.layout import model_dir
+        from veomni.hyper_parallel.checkpoint import NativeHyperCheckpointer
+
+        adapted = []
+
+        def adapt(state):
+            result = SimpleNamespace(wrapped=state)
+            adapted.append(result)
+            return result
+
+        state = {"model": nn.Linear(2, 2)}
+        if with_optimizer:
+            state["optimizer"] = torch.optim.AdamW(state["model"].parameters())
+        legacy_dir = str(tmp_path / "old") if legacy else None
+        with (
+            patch.object(NativeHyperCheckpointer, "_legacy_fused_dir", return_value=legacy_dir),
+            patch.object(NativeHyperCheckpointer, "_create_storage_reader"),
+            patch.object(NativeHyperCheckpointer, "_load_extra_state") as extra,
+            patch("veomni.hyper_parallel.checkpoint._NativeState", side_effect=adapt),
+            patch("veomni.checkpoint.dcp_checkpointer.dcp.load") as load,
+        ):
+            assert (
+                NativeHyperCheckpointer.load(str(tmp_path), state, module="text", trainable_only=trainable_only)
+                is state
+            )
+        assert len(adapted) == (2 if with_optimizer else 1)
+        assert isinstance(adapted[0].wrapped, ModelState)
+        if with_optimizer:
+            assert isinstance(adapted[1].wrapped, OptimizerState)
+            assert adapted[1].wrapped._load
+        payloads = [value for call in load.call_args_list for value in call.kwargs["state_dict"].values()]
+        assert payloads == adapted
+        assert load.call_args_list[0].kwargs["planner"].strict_model is (not trainable_only)
+        extra.assert_called_once_with(
+            checkpoint_dir=legacy_dir if legacy else model_dir(str(tmp_path), "text"), state=state
+        )
+
+
+class TestHyperCheckpointDiscovery:
+    """Explicit Hyper auto-resume does not extend native checkpoint discovery."""
+
+    @staticmethod
+    def complete(root, step, modules=("",)):
+        from veomni.checkpoint.layout import model_dir, step_dir, weights_dir, write_manifest
+        from veomni.hyper_parallel import HYPER_MARKER_FILENAME
+
+        path = step_dir(str(root / "checkpoints"), step)
+        for module in modules:
+            Path(weights_dir(path, module)).mkdir(parents=True)
+            (Path(model_dir(path, module)) / HYPER_MARKER_FILENAME).write_text('{"format_version": 1}')
+        write_manifest(path, step, 2)
+        return Path(path)
+
+    @pytest.mark.parametrize("modules", [("",), ("text", "vision")])
+    def test_complete_hyper_step_is_not_a_native_step(self, tmp_path, modules):
+        from veomni.arguments import CheckpointConfig
+        from veomni.checkpoint.layout import checkpoint_is_complete
+        from veomni.hyper_parallel import _hyper_checkpoint_path
+
+        path = self.complete(tmp_path, 3, modules)
+        assert _hyper_checkpoint_path(str(tmp_path)) == str(path)
+        assert not checkpoint_is_complete(str(path))
+        assert CheckpointConfig(manager="hyper", output_dir=str(tmp_path), load_path="auto").load_path == str(path)
+        assert CheckpointConfig(output_dir=str(tmp_path), load_path="auto").load_path == "auto"
+
+    @pytest.mark.parametrize("failure", ["manifest", "marker", "malformed", "version", "null"])
+    def test_skip_incomplete_newer_steps(self, tmp_path, failure):
+        from veomni.checkpoint.layout import manifest_path, model_dir
+        from veomni.hyper_parallel import HYPER_MARKER_FILENAME, _hyper_checkpoint_path
+
+        older = self.complete(tmp_path, 3)
+        newer = self.complete(tmp_path, 4, ("text", "vision"))
+        marker = Path(model_dir(str(newer), "vision")) / HYPER_MARKER_FILENAME
+        if failure == "manifest":
+            Path(manifest_path(str(newer))).unlink()
+        elif failure == "marker":
+            marker.unlink()
+        else:
+            marker.write_text(
+                {"malformed": "{", "version": '{"format_version": 9}', "null": json.dumps(None)}[failure]
+            )
+        assert _hyper_checkpoint_path(str(tmp_path)) == str(older)
+
+    def test_no_complete_step_and_explicit_load_path(self, tmp_path):
+        from veomni.arguments import CheckpointConfig
+
+        assert CheckpointConfig(manager="hyper", output_dir=str(tmp_path), load_path="auto").load_path is None
+        assert CheckpointConfig(manager="hyper", load_path="/explicit/step").load_path == "/explicit/step"
 
 
 def _fsdp2_multi_optimizer_worker(rank: int, world_size: int, tmp_path: Path):

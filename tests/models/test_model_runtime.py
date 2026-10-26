@@ -24,7 +24,9 @@ still needs the multi-rank suites. The seam tests below need no distribution
 at all.
 """
 
-from types import SimpleNamespace
+import sys
+from importlib import import_module
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -280,6 +282,73 @@ def test_runtime_forwards_low_precision_reduce_scatter_config(monkeypatch, enabl
     assert len(calls) == 1
     assert calls[0]["low_precision_reduce_scatter_comm"] is enabled
     assert calls[0]["mixed_precision"] is config.mixed_precision
+
+
+@pytest.mark.parametrize("use_hyper", [False, True])
+@pytest.mark.parametrize(
+    "module_name,trainer_name,method,native_factory,hyper_factory,model_name",
+    [
+        ("vlm_trainer", "VLMTrainer", "_build_model_runtime", "VLMModelRuntime", "vlm_runtime", "base"),
+        ("dit_trainer", "DiTTrainer", "_build_model_runtime", "DiTModelRuntime", "dit_runtime", "base"),
+        ("text_dpo_trainer", "TextDPOTrainer", "_build_policy_model_runtime", None, "text_runtime", "policy"),
+        (
+            "text_dpo_trainer",
+            "TextDPOTrainer",
+            "_build_reference_model_runtime",
+            "DPOReferenceModelRuntime",
+            "reference_runtime",
+            "reference",
+        ),
+    ],
+)
+def test_task_runtime_selection(
+    monkeypatch, use_hyper, module_name, trainer_name, method, native_factory, hyper_factory, model_name
+):
+    module = import_module(f"veomni.trainer.{module_name}")
+    args = SimpleNamespace(
+        model=SimpleNamespace(use_hyper_parallel=use_hyper),
+        train=object(),
+        dpo_config=SimpleNamespace(refer_model_precision="bfloat16"),
+    )
+    calls = []
+
+    def record(*positional, **kwargs):
+        calls.append((positional, kwargs))
+        return "runtime"
+
+    adapter = ModuleType("veomni.hyper_parallel.model_runtime")
+    setattr(adapter, hyper_factory, record)
+    monkeypatch.setitem(sys.modules, adapter.__name__, adapter if use_hyper else None)
+    trainer = getattr(module, trainer_name).__new__(getattr(module, trainer_name))
+    trainer.base = SimpleNamespace(args=args, _build_model_runtime=record)
+    if native_factory:
+        monkeypatch.setattr(module, native_factory, record)
+
+    assert getattr(trainer, method)() == "runtime"
+    expected_kwargs = {"train": args.train}
+    if model_name == "reference":
+        expected_kwargs["torch_dtype"] = "bfloat16"
+    expected = ((args.model, model_name), expected_kwargs)
+    if not use_hyper and model_name == "policy":
+        expected = ((), {"model_name": "policy"})
+    assert calls == [expected]
+
+
+@pytest.mark.parametrize("task", ["text", "vlm", "dit", "dpo", "omni", "omni_infer"])
+def test_optional_launcher_uses_the_original_trainer(monkeypatch, task):
+    from veomni.hyper_parallel import train
+
+    args = SimpleNamespace(model=SimpleNamespace(use_hyper_parallel=True))
+    module_name, trainer_name, _ = train._TASKS[task]
+    calls = []
+
+    def load_module(name, package):
+        calls.append(name)
+        return SimpleNamespace(**{trainer_name: lambda supplied: supplied})
+
+    monkeypatch.setattr(train, "import_module", load_module)
+    assert train.build_trainer(task, args) is args
+    assert calls == [f"..trainer.{module_name}"]
 
 
 class TestWhereTheLoaderReadsTheConfigFrom:
