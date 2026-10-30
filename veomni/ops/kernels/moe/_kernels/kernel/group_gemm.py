@@ -323,10 +323,12 @@ def group_gemm_same_mn_kernel(
     if k == 0:
         if not ACCUMULATE_TO_C:
             # Zero out the corresponding output region.
+            zeros = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            if c_block_ptr.dtype.element_ty != tl.float32:
+                zeros = zeros.to(c_block_ptr.dtype.element_ty)
             store_block_with_pred_2d(
                 c_block_ptr,
-                # tl.zeros(..., dtype=c_block_ptr.dtype.element_ty) raises "not implemented".
-                tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32).to(c_block_ptr.dtype.element_ty),
+                zeros,
                 M_ALIGNED,
                 N_ALIGNED,
             )
@@ -351,7 +353,10 @@ def group_gemm_same_mn_kernel(
         a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_K))
         b_block_ptr = tl.advance(b_block_ptr, (BLOCK_K, 0))
 
-    store_block_with_pred_2d(c_block_ptr, out.to(c_block_ptr.dtype.element_ty), M_ALIGNED, N_ALIGNED)
+    # FP32 outputs write the FP32 accumulator directly, without BF16 rounding.
+    if c_block_ptr.dtype.element_ty != tl.float32:
+        out = out.to(c_block_ptr.dtype.element_ty)
+    store_block_with_pred_2d(c_block_ptr, out, M_ALIGNED, N_ALIGNED)
 
 
 def group_gemm_same_mn(

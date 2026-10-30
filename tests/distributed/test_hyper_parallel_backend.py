@@ -1,4 +1,4 @@
-# Copyright 2025 Bytedance Ltd. and/or its affiliates
+# Copyright 2025-2026 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -325,6 +325,25 @@ def test_hyper_fsdp_backend_rejects_invalid_modes_and_values():
         parallelize_model_fsdp2(object(), fsdp_backend="invalid")
 
 
+def test_fp32_expert_grad_config_is_opt_in_and_validated():
+    assert not FSDPConfig().hyper_expert_grad_dtype_fp32
+    assert FSDPConfig(fsdp_backend="hyper", hyper_expert_grad_dtype_fp32=True).hyper_expert_grad_dtype_fp32
+    with pytest.raises(ValueError, match="Hyper FSDP2"):
+        FSDPConfig(hyper_expert_grad_dtype_fp32=True)
+    with pytest.raises(ValueError, match="BF16"):
+        FSDPConfig(
+            fsdp_backend="hyper",
+            hyper_expert_grad_dtype_fp32=True,
+            mixed_precision=torch_parallelize.MixedPrecisionConfig(param_dtype="float16"),
+        )
+    with pytest.raises(ValueError, match="FP32 gradient reduction"):
+        FSDPConfig(
+            fsdp_backend="hyper",
+            hyper_expert_grad_dtype_fp32=True,
+            mixed_precision=torch_parallelize.MixedPrecisionConfig(reduce_dtype="bfloat16"),
+        )
+
+
 def test_hyper_optimizer_requires_muon():
     with pytest.raises(ValueError, match="requires optimizer type='muon'"):
         OptimizerConfig(type="adamw", use_hyper_optimizer=True)
@@ -375,7 +394,9 @@ def test_submodule_wrap_uses_safe_internal_defaults(device, compiled, known):
         [("block", root.block)], root_model=root, device_type=device, compiled=compiled
     )
     expected = (
-        {root.block: [root.block.self_attn, root.block.mlp]} if device == "cuda" and not compiled and known else {}
+        {root.block: [root.block.self_attn, root.block.mlp]}
+        if device in ("cuda", "npu") and not compiled and known
+        else {}
     )
     assert result == expected
 
@@ -413,21 +434,22 @@ def test_submodule_prefetch_keeps_nested_expert_and_fp32_units():
         block.second.experts = PrefetchUnit()
         existing = [block.second.experts, block.second.router]
         stages.append(build_submodule_prefetch_stages(block, [block.first, block.second], existing))
-        assert stages[-1] == [[block], [block.first], [block.second, *existing]]
+        assert stages[-1] == [[block.first], [block.second, *existing]]
     configure_submodule_prefetch(stages)
     first, second = blocks
-    assert first.forward_targets == [first.first]
-    assert first.first.forward_targets == stages[0][2] + [second, second.first]
-    assert first.second.forward_targets == [second, second.first, *stages[1][2]]
+    assert first.first.forward_targets == stages[0][1] + [second.first]
+    assert first.second.forward_targets == [second.first, *stages[1][1]]
     assert first.second.experts.forward_targets == first.second.forward_targets
-    assert second.backward_targets == stages[1][2]
-    assert second.second.backward_targets == [second.first]
-    assert second.first.backward_targets == [first, *stages[0][2]]
+    assert second.second.backward_targets == [first.first, *stages[0][1]]
+    assert second.second.experts.backward_targets == second.second.backward_targets
+    assert second.second.router.backward_targets == second.second.backward_targets
+    assert second.first.backward_targets == [first.first, *stages[0][1]]
     assert first.first.backward_targets == []
     assert second.second.forward_targets == []
 
 
 @pytest.mark.parametrize("backend, interval", [("hyper", 1), ("hyper", 2), ("torch", 1)])
+@pytest.mark.parametrize("keep_full_head", [False, True])
 @pytest.mark.parametrize(
     "device, known, prefetch",
     [
@@ -438,9 +460,21 @@ def test_submodule_prefetch_keeps_nested_expert_and_fp32_units():
     ],
 )
 def test_submodule_wrap_integration_uses_internal_device_policy(
-    monkeypatch, device, known, prefetch, backend, interval
+    monkeypatch,
+    device,
+    known,
+    prefetch,
+    backend,
+    interval,
+    keep_full_head,
 ):
     model = nn.Module()
+    model.embed_tokens = PrefetchUnit()
+    model.lm_head = PrefetchUnit()
+    model.norm = PrefetchUnit()
+    model.get_input_embeddings = lambda: model.embed_tokens
+    model.get_output_embeddings = lambda: model.lm_head
+    model._fsdp_plan = {"lm_head": "keep_full_weight"} if keep_full_head else {}
     block_type = Qwen3MoeDecoderLayer if known else PrefetchBlock
     model.layers = nn.ModuleList([block_type(), block_type()])
     model._no_split_modules = [block_type.__name__]
@@ -494,20 +528,35 @@ def test_submodule_wrap_integration_uses_internal_device_policy(
         enable_forward_prefetch=prefetch,
         hyper_reduce_comm_interval=interval,
     )
-    if backend == "hyper" and device == "cuda" and known:
+    if backend == "hyper" and device in ("cuda", "npu") and known:
         assert [call[0] for call in calls] == [
             blocks[0].self_attn,
             blocks[0].mlp,
-            blocks[0],
             blocks[1].self_attn,
             blocks[1].mlp,
-            blocks[1],
+            model.embed_tokens,
+            *([] if keep_full_head else [model.lm_head]),
             model,
         ]
-        assert calls[2][2] == {id(blocks[0].weight)}
+        root_params = {id(blocks[0].weight), id(blocks[1].weight), id(model.norm.weight)}
+        if keep_full_head:
+            root_params.add(id(model.lm_head.weight))
+            assert not isinstance(model.lm_head, WrappedUnit)
+        assert calls[-1][2] == root_params
         if prefetch:
-            assert blocks[0].self_attn.forward_targets == [blocks[0].mlp, blocks[1], blocks[1].self_attn]
-            assert blocks[0].mlp.forward_targets == [blocks[1], blocks[1].self_attn, blocks[1].mlp]
+            assert model.embed_tokens.forward_targets == [blocks[0].self_attn, blocks[0].mlp]
+            assert blocks[0].self_attn.forward_targets == [blocks[0].mlp, blocks[1].self_attn]
+            assert blocks[0].mlp.forward_targets == [blocks[1].self_attn, blocks[1].mlp]
+            assert blocks[1].self_attn.forward_targets == [
+                blocks[1].mlp,
+                *([] if keep_full_head else [model.lm_head]),
+            ]
+            if not keep_full_head:
+                assert model.lm_head.backward_targets == [blocks[1].mlp, blocks[1].self_attn]
+            assert blocks[1].mlp.backward_targets == [blocks[0].self_attn, blocks[0].mlp]
+            assert blocks[1].self_attn.backward_targets == [blocks[0].self_attn, blocks[0].mlp]
+            assert blocks[0].mlp.backward_targets == [blocks[0].self_attn, model.embed_tokens]
+            assert blocks[0].self_attn.backward_targets == [model.embed_tokens]
         else:
             assert not hasattr(blocks[0].self_attn, "forward_targets")
     else:

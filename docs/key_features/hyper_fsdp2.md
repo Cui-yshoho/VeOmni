@@ -95,3 +95,14 @@ root drains outstanding reductions at backward completion. The default is
 Values above `1` require the Hyper backend and a HyperParallel version with
 this API. With Hyper communication fusion enabled, Hyper falls back to
 interval `1`. A larger interval retains more in-flight gradient buffers.
+## FP32 expert weight gradients
+
+For CUDA Qwen3 MoE with `moe_implementation: fused_triton`, `ep_size: 1`,
+BF16 compute parameters, and FP32 gradient reduction, set
+`model.accelerator.fsdp_config.hyper_expert_grad_dtype_fp32: true`. This is
+opt-in and requires PyTorch `Tensor.grad_dtype`. The unsharded `gate_up_proj`
+and `down_proj` expert leaves then accept FP32 gradients. The merged Triton
+grouped GEMM accumulates BF16 products in FP32 and writes that accumulator
+directly into the FP32 gradient buffer, which can be used for ReduceScatter.
+Other parameters and the default configuration retain their existing behavior.
+The option does not support expert parallelism or LoRA.
