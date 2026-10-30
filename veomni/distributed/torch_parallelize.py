@@ -1,4 +1,4 @@
-# Copyright 2025 Bytedance Ltd. and/or its affiliates
+# Copyright 2025-2026 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -915,7 +915,12 @@ def parallelize_model_fsdp2(
         logger.info_rank0(f"{layer_fqn=}, {layer_mod._fsdp_modules=}")
 
     if submodule_wrap_targets:
-        for module in (model.get_input_embeddings(), model.get_output_embeddings()):
+        io_wrap_targets = [model.get_input_embeddings()]
+        # Fused losses read lm_head.weight without invoking the head's hooks.
+        # Let the root own declared full-weight heads so unshard/wait precedes that read.
+        if (getattr(model, "_fsdp_plan", None) or {}).get("lm_head") != "keep_full_weight":
+            io_wrap_targets.append(model.get_output_embeddings())
+        for module in io_wrap_targets:
             if not isinstance(module, fsdp_module_type):
                 apply_fully_shard(module, fsdp_kwargs)
 
@@ -969,13 +974,12 @@ def parallelize_model_fsdp2(
             for _, block in target_modules
         ]
         block_stages.insert(0, [[model.get_input_embeddings()]])
-        block_stages.append([[model.get_output_embeddings()]])
+        block_stages.extend([[[module]] for module in io_wrap_targets[1:]])
         configure_submodule_prefetch(block_stages)
         for unit in block_stages[1][-1]:
             unit.set_modules_to_backward_prefetch(block_stages[1][0] + block_stages[0][0])
-        model.get_output_embeddings().set_modules_to_backward_prefetch(
-            [unit for stage in reversed(block_stages[-2]) for unit in stage]
-        )
+        for module in io_wrap_targets[1:]:
+            module.set_modules_to_backward_prefetch([unit for stage in reversed(block_stages[-2]) for unit in stage])
         logger.info_rank0("[hyper-forward-prefetch] policy=stage depth=2")
         module_names = {id(module): name for name, module in model.named_modules()}
         logger.info_rank0(

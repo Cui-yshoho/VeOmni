@@ -1,4 +1,4 @@
-# Copyright 2025 Bytedance Ltd. and/or its affiliates
+# Copyright 2025-2026 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -430,6 +430,7 @@ def test_submodule_prefetch_keeps_nested_expert_and_fp32_units():
 
 
 @pytest.mark.parametrize("backend, interval", [("hyper", 1), ("hyper", 2), ("torch", 1)])
+@pytest.mark.parametrize("keep_full_head", [False, True])
 @pytest.mark.parametrize(
     "device, known, prefetch",
     [
@@ -440,7 +441,13 @@ def test_submodule_prefetch_keeps_nested_expert_and_fp32_units():
     ],
 )
 def test_submodule_wrap_integration_uses_internal_device_policy(
-    monkeypatch, device, known, prefetch, backend, interval
+    monkeypatch,
+    device,
+    known,
+    prefetch,
+    backend,
+    interval,
+    keep_full_head,
 ):
     model = nn.Module()
     model.embed_tokens = PrefetchUnit()
@@ -448,6 +455,7 @@ def test_submodule_wrap_integration_uses_internal_device_policy(
     model.norm = PrefetchUnit()
     model.get_input_embeddings = lambda: model.embed_tokens
     model.get_output_embeddings = lambda: model.lm_head
+    model._fsdp_plan = {"lm_head": "keep_full_weight"} if keep_full_head else {}
     block_type = Qwen3MoeDecoderLayer if known else PrefetchBlock
     model.layers = nn.ModuleList([block_type(), block_type()])
     model._no_split_modules = [block_type.__name__]
@@ -508,16 +516,24 @@ def test_submodule_wrap_integration_uses_internal_device_policy(
             blocks[1].self_attn,
             blocks[1].mlp,
             model.embed_tokens,
-            model.lm_head,
+            *([] if keep_full_head else [model.lm_head]),
             model,
         ]
-        assert calls[-1][2] == {id(blocks[0].weight), id(blocks[1].weight), id(model.norm.weight)}
+        root_params = {id(blocks[0].weight), id(blocks[1].weight), id(model.norm.weight)}
+        if keep_full_head:
+            root_params.add(id(model.lm_head.weight))
+            assert not isinstance(model.lm_head, WrappedUnit)
+        assert calls[-1][2] == root_params
         if prefetch:
             assert model.embed_tokens.forward_targets == [blocks[0].self_attn, blocks[0].mlp]
             assert blocks[0].self_attn.forward_targets == [blocks[0].mlp, blocks[1].self_attn]
             assert blocks[0].mlp.forward_targets == [blocks[1].self_attn, blocks[1].mlp]
-            assert blocks[1].self_attn.forward_targets == [blocks[1].mlp, model.lm_head]
-            assert model.lm_head.backward_targets == [blocks[1].mlp, blocks[1].self_attn]
+            assert blocks[1].self_attn.forward_targets == [
+                blocks[1].mlp,
+                *([] if keep_full_head else [model.lm_head]),
+            ]
+            if not keep_full_head:
+                assert model.lm_head.backward_targets == [blocks[1].mlp, blocks[1].self_attn]
             assert blocks[1].mlp.backward_targets == [blocks[0].self_attn, blocks[0].mlp]
             assert blocks[1].self_attn.backward_targets == [blocks[0].self_attn, blocks[0].mlp]
             assert blocks[0].mlp.backward_targets == [blocks[0].self_attn, model.embed_tokens]
