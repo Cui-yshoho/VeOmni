@@ -394,6 +394,14 @@ class VeOmniModelRuntime:
             kwargs["is_peft_model"] = True
         if args.accelerator.fsdp_config.hyper_reduce_comm_interval != 1:
             kwargs["hyper_reduce_comm_interval"] = args.accelerator.fsdp_config.hyper_reduce_comm_interval
+        if args.accelerator.fsdp_config.hyper_expert_grad_dtype_fp32:
+            if args.ops_implementation.moe_implementation != "fused_triton":
+                raise ValueError("hyper_expert_grad_dtype_fp32 requires moe_implementation='fused_triton'.")
+            if args.accelerator.ep_size != 1:
+                raise ValueError("hyper_expert_grad_dtype_fp32 currently requires ep_size=1.")
+            if args.lora_config:
+                raise ValueError("hyper_expert_grad_dtype_fp32 is not supported with LoRA.")
+            kwargs["hyper_expert_grad_dtype_fp32"] = True
 
         muon_expert_zero_comm = args.optimizer.type == "muon" and args.optimizer.muon_expert_zero_comm
 

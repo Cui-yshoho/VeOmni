@@ -462,11 +462,32 @@ def parallelize_model_fsdp2(
 
     use_hyper_fsdp2 = fsdp_backend == "hyper"
     reduce_comm_interval = kwargs.pop("hyper_reduce_comm_interval", 1)
+    expert_grad_dtype_fp32 = kwargs.pop("hyper_expert_grad_dtype_fp32", False)
     if type(reduce_comm_interval) is not int or reduce_comm_interval < 1:
         raise ValueError("hyper_reduce_comm_interval must be a positive integer.")
     if reduce_comm_interval != 1 and not use_hyper_fsdp2:
         raise ValueError("hyper_reduce_comm_interval > 1 requires fsdp_backend='hyper'.")
     parallel_state = get_parallel_state()
+    expert_grad_param_ids = set()
+    if expert_grad_dtype_fp32:
+        if not use_hyper_fsdp2 or parallel_state.ep_enabled:
+            raise ValueError("FP32 expert gradients require Hyper FSDP2 with ep_size=1.")
+        if not mixed_precision.enable or (
+            mixed_precision.param_dtype != "bfloat16" or mixed_precision.reduce_dtype != "float32"
+        ):
+            raise ValueError("FP32 expert gradients require BF16 parameters and FP32 gradient reduction.")
+        if get_device_type() != "cuda" or getattr(getattr(model, "config", None), "model_type", None) != "qwen3_moe":
+            raise ValueError("FP32 expert gradients currently support Qwen3 MoE on CUDA only.")
+        for module in model.modules():
+            if module.__class__.__name__ == "Qwen3MoeExperts":
+                for name in ("gate_up_proj", "down_proj"):
+                    param = getattr(module, name, None)
+                    if not isinstance(param, nn.Parameter) or param.ndim != 3:
+                        raise ValueError(f"Qwen3 MoE expert parameter {name} must be a 3D Parameter.")
+                    expert_grad_param_ids.add(id(param))
+        if not expert_grad_param_ids:
+            raise ValueError("FP32 expert gradients requested but no Qwen3 MoE expert parameters were found.")
+        logger.info_rank0(f"FP32 expert wgrad enabled for {len(expert_grad_param_ids)} parameters.")
     if use_hyper_fsdp2:
         from .hyper_fsdp2 import (
             extra_parallel_gradient_scaling_factor,
@@ -708,12 +729,15 @@ def parallelize_model_fsdp2(
         fsdp_kwargs["ignored_params"] = persistent_extra_parallel_params
     # prepare mp_policy kwargs
     if mixed_precision.enable:
-        mp_policy = mixed_precision_policy_type(
+        mp_kwargs = dict(
             param_dtype=getattr(torch, mixed_precision.param_dtype) if mixed_precision.param_dtype else None,
             reduce_dtype=getattr(torch, mixed_precision.reduce_dtype) if mixed_precision.reduce_dtype else None,
             output_dtype=getattr(torch, mixed_precision.output_dtype) if mixed_precision.output_dtype else None,
             cast_forward_inputs=mixed_precision.cast_forward_inputs,
         )
+        if expert_grad_dtype_fp32:
+            mp_kwargs["grad_dtype_fn"] = lambda param: torch.float32 if id(param) in expert_grad_param_ids else None
+        mp_policy = mixed_precision_policy_type(**mp_kwargs)
         fsdp_kwargs["mp_policy"] = mp_policy
     # prepare offload_policy kwargs
     enable_fsdp_cpu_offload = kwargs.pop("enable_fsdp_offload", False)

@@ -325,6 +325,25 @@ def test_hyper_fsdp_backend_rejects_invalid_modes_and_values():
         parallelize_model_fsdp2(object(), fsdp_backend="invalid")
 
 
+def test_fp32_expert_grad_config_is_opt_in_and_validated():
+    assert not FSDPConfig().hyper_expert_grad_dtype_fp32
+    assert FSDPConfig(fsdp_backend="hyper", hyper_expert_grad_dtype_fp32=True).hyper_expert_grad_dtype_fp32
+    with pytest.raises(ValueError, match="Hyper FSDP2"):
+        FSDPConfig(hyper_expert_grad_dtype_fp32=True)
+    with pytest.raises(ValueError, match="BF16"):
+        FSDPConfig(
+            fsdp_backend="hyper",
+            hyper_expert_grad_dtype_fp32=True,
+            mixed_precision=torch_parallelize.MixedPrecisionConfig(param_dtype="float16"),
+        )
+    with pytest.raises(ValueError, match="FP32 gradient reduction"):
+        FSDPConfig(
+            fsdp_backend="hyper",
+            hyper_expert_grad_dtype_fp32=True,
+            mixed_precision=torch_parallelize.MixedPrecisionConfig(reduce_dtype="bfloat16"),
+        )
+
+
 def test_hyper_optimizer_requires_muon():
     with pytest.raises(ValueError, match="requires optimizer type='muon'"):
         OptimizerConfig(type="adamw", use_hyper_optimizer=True)

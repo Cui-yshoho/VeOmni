@@ -416,6 +416,16 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
 
         ctx.num_experts = num_experts
         ctx.swiglu_limit = swiglu_limit
+        # Capture the unsharded leaf's requested gradient dtype before saved
+        # tensor hooks or activation checkpointing can replace its view.
+        ctx.fc1_grad_dtype = (
+            getattr(fc1_1_2_weight, "grad_dtype", fc1_1_2_weight.dtype)
+            if fc1_1_2_weight.is_leaf
+            else fc1_1_2_weight.dtype
+        )
+        ctx.fc2_grad_dtype = (
+            getattr(fc2_weight, "grad_dtype", fc2_weight.dtype) if fc2_weight.is_leaf else fc2_weight.dtype
+        )
         ctx.save_for_backward(
             gate_weights,
             fc1_1_2_weight,
@@ -476,7 +486,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
         # MOE Step 9 - wgrad
         grad_fc2_weight = None
         if fc2_weight.requires_grad:
-            grad_fc2_weight = torch.empty_like(fc2_weight)
+            grad_fc2_weight = torch.empty_like(fc2_weight, dtype=ctx.fc2_grad_dtype)
             group_gemm_same_mn(
                 a=grad_fc2_output,
                 b=fc1_weighted_output,
@@ -525,7 +535,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
         # MOE Step 4 - single wgrad for merged fc1
         grad_fc1_1_2_weight = None
         if fc1_1_2_weight.requires_grad:
-            grad_fc1_1_2_weight = torch.empty_like(fc1_1_2_weight)
+            grad_fc1_1_2_weight = torch.empty_like(fc1_1_2_weight, dtype=ctx.fc1_grad_dtype)
             group_gemm_same_mn(
                 a=grad_fc1_output,
                 b=scatter_output,
