@@ -179,6 +179,7 @@ jobs:
       - name: Run distributed tests
         run: |
           uv run --frozen pytest -s -x tests/distributed/test_async_offload_unit.py
+          uv run --frozen pytest -s -x tests/distributed/test_hyper_parallel_backend.py
           uv run --frozen pytest -s -x tests/distributed/test_dummy_forward.py
           uv run --frozen pytest -s -x tests/distributed/test_emb_parallel.py
           uv run --frozen pytest -s -x tests/distributed/test_parallel_plan.py
@@ -228,3 +229,11 @@ jobs:
           uv run --frozen pytest -s -x tests/lora/test_moe_lora_trainer.py
           uv run --frozen pytest -s -x tests/lora/test_moe_lora_ep2.py
           uv run --frozen pytest -s -x tests/lora/test_moe_lora_ep_sharded_stream_load.py
+      - name: Run Hyper FSDP fused head integration
+        # Hyper is optional and not part of VeOmni's lockfile. Fetch the exact
+        # API revision under test without changing the synced environment.
+        run: |
+          git init "$RUNNER_TEMP/hyper-parallel"
+          git -C "$RUNNER_TEMP/hyper-parallel" fetch --depth=1 https://github.com/mxysfive/hyper-parallel.git d57a8dd5303e86e2f9630aa432ea527e6b66fee1
+          git -C "$RUNNER_TEMP/hyper-parallel" checkout --detach FETCH_HEAD
+          PYTHONPATH="$RUNNER_TEMP/hyper-parallel:$PWD" .venv/bin/python -m torch.distributed.run --standalone --nproc-per-node=2 tests/distributed/hyper_fsdp_fused_head_worker.py

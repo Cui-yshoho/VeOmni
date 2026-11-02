@@ -55,6 +55,7 @@ config.add_import(
 )
 config.drop_import_names("MoeCausalLMOutputWithPast")
 config.add_import("veomni.utils.moe_router_replay", names=["get_active_replay", "maybe_replay_indices"])
+config.add_import("veomni.ops.kernels.cross_entropy.fused_head", names=["FusedCrossEntropy"])
 
 config.add_post_import_block(
     """
@@ -324,8 +325,22 @@ def qwen3_moe_forcausallm_forward_patched(
     logits = None
     fused_linear_aux = None
     if labels is not None:
+        # An independently sharded head must read its weight inside its own
+        # forward so FSDP can unshard and register its backward hooks.
+        if isinstance(self.lm_head, FusedCrossEntropy):
+            use_fused_loss = veomni_causal_lm_loss.use_non_eager_impl
+            loss_fn = veomni_causal_lm_loss if use_fused_loss else self.loss_function
+            loss, logits, *aux_tensors = self.lm_head(
+                hidden_states,
+                _veomni_loss_fn=loss_fn,
+                _veomni_labels=labels,
+                _veomni_vocab_size=self.config.vocab_size,
+                _veomni_use_fused_loss=use_fused_loss,
+                **kwargs,
+            )
+            fused_linear_aux = FusedLinearAuxOutput.from_loss_slots(*aux_tensors)
         # Modification: OpSlot guard for cross-entropy loss.
-        if veomni_causal_lm_loss.use_non_eager_impl:
+        elif veomni_causal_lm_loss.use_non_eager_impl:
             loss, logits, fused_linear_aux = veomni_causal_lm_loss(
                 logits=logits,
                 labels=labels,

@@ -22,8 +22,8 @@ _COMPUTE_BOUNDARIES = {
 
 
 def resolve_submodule_wrap_targets(target_modules, *, root_model, device_type, compiled=False):
-    """Use validated CUDA boundaries; leave unknown or shared blocks intact."""
-    if device_type != "cuda" or compiled:
+    """Use validated compute boundaries; leave unknown or shared blocks intact."""
+    if device_type not in ("cuda", "npu") or compiled:
         return {}
     parameter_names = {}
     for name, param in root_model.named_parameters(remove_duplicate=False):
@@ -51,13 +51,13 @@ def resolve_submodule_wrap_targets(target_modules, *, root_model, device_type, c
 
 
 def build_submodule_prefetch_stages(block, children, existing_units):
-    """Keep residual, EP and FP32 units with their corresponding compute stage."""
-    stages = [[block]] + [[child] for child in children]
+    """Keep EP and FP32 units with their corresponding compute stage."""
+    stages = [[child] for child in children]
     for unit in existing_units:
         if unit is block or any(unit is child for child in children):
             continue
         stage = stages[0]
-        for child, candidate in zip(children, stages[1:]):
+        for child, candidate in zip(children, stages):
             if any(unit is descendant for descendant in child.modules()):
                 stage = candidate
                 break
@@ -66,27 +66,19 @@ def build_submodule_prefetch_stages(block, children, existing_units):
 
 
 def configure_submodule_prefetch(block_stages):
-    """Prefetch two compute stages ahead; retain reverse-stage backward links."""
-    entries = [(stage, index > 0 or len(block) == 1) for block in block_stages for index, stage in enumerate(block)]
+    """Prefetch two stages ahead, including before whole-block backward replay."""
+    entries = [stage for block in block_stages for stage in block]
     position = 0
     for index, stages in enumerate(block_stages):
         for stage_index, stage in enumerate(stages):
-            if stage_index == 0 and len(stages) > 1:
-                forward = stages[1]
-            else:
-                forward, remaining = [], 2
-                for following, compute in entries[position + 1 :]:
-                    forward.extend(following)
-                    remaining -= int(compute)
-                    if remaining == 0:
-                        break
-            if stage_index > 1:
+            forward = [unit for following in entries[position + 1 : position + 3] for unit in following]
+            # Whole-block replay starts at the last stage's backward hook, so
+            # launch the preceding block's AGs there before this block's RS.
+            if stage_index and (not index or len(block_stages[index - 1]) == 1):
                 backward = stages[stage_index - 1]
-            elif stage_index == 0 and len(stages) > 1:
-                backward = stages[-1]
             elif index:
                 preceding = block_stages[index - 1]
-                backward = preceding[0] + (preceding[-1] if len(preceding) > 1 else [])
+                backward = [unit for previous in preceding for unit in previous]
             else:
                 backward = []
             for unit in stage:
