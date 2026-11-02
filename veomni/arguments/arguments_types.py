@@ -626,6 +626,10 @@ class FSDPConfig:
         default=1,
         metadata={"help": "Hyper FSDP units between gradient reduction submission and waiting."},
     )
+    hyper_expert_grad_dtype_fp32: bool = field(
+        default=False,
+        metadata={"help": "Write Qwen3 MoE Triton expert weight gradients directly in FP32 (Hyper FSDP2)."},
+    )
 
     def __post_init__(self):
         if self.fsdp_mode not in ("ddp", "fsdp2", "eager"):
@@ -647,6 +651,13 @@ class FSDPConfig:
             raise ValueError("hyper_reduce_comm_interval must be a positive integer.")
         if self.hyper_reduce_comm_interval != 1 and self.fsdp_backend != "hyper":
             raise ValueError("hyper_reduce_comm_interval > 1 requires fsdp_backend='hyper'.")
+        if self.hyper_expert_grad_dtype_fp32:
+            if self.fsdp_backend != "hyper" or self.fsdp_mode != "fsdp2":
+                raise ValueError("hyper_expert_grad_dtype_fp32 requires Hyper FSDP2.")
+            if not self.mixed_precision.enable or self.mixed_precision.param_dtype != "bfloat16":
+                raise ValueError("hyper_expert_grad_dtype_fp32 requires BF16 mixed precision parameters.")
+            if self.mixed_precision.reduce_dtype != "float32":
+                raise ValueError("hyper_expert_grad_dtype_fp32 requires FP32 gradient reduction.")
 
 
 @dataclass

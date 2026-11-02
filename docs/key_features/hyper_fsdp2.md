@@ -25,17 +25,22 @@ HyperParallel is imported lazily. Leaving `fsdp_backend` unset is equivalent to 
 Selecting the Hyper backend also selects its internal device policy; no wrap
 declarations or prefetch-depth settings are required.
 
-On CUDA, Qwen3-MoE decoder blocks and Qwen3-VL-MoE text/vision blocks use the
+On CUDA and NPU, Qwen3-MoE decoder blocks and Qwen3-VL-MoE text/vision blocks use the
 validated attention and MLP/MoE boundaries. Attention prefetches the current
 MLP and next attention; MLP prefetches the next attention and MLP. Residual
-parameters such as norms remain on the enclosing block. Existing EP and FP32
+parameters such as norms in split blocks remain on the root unit. Existing EP and FP32
 exception units retain their mesh and precision policy and follow their
 enclosing compute stage.
 
-NPU, unrecognized block types, compiled models and blocks with parameters
-shared across boundaries retain whole-block wrapping. Persistent ExtraParallel
-blocks also retain their existing wrapping. NPU and models without eligible
-split blocks use the existing prefetch flow; mixed split/unsplit blocks
+Unrecognized block types, compiled models and blocks with parameters shared
+across boundaries retain whole-block wrapping. Models with a mixed-precision
+`output_dtype` retain their original block and child boundaries, preserving
+their input and output casts. Models with frozen parameters retain whole-block
+wrapping (and the original CUDA child boundaries when `output_dtype` is set)
+and use no manual Hyper prefetch, since frozen units may not participate in
+backward. Persistent ExtraParallel blocks
+also retain their existing wrapping. Models without eligible split blocks use
+the existing prefetch flow; mixed split/unsplit blocks
 participate in the same internal stage chain.
 The framework does not infer arbitrary execution order from child registration
 order or split every small module. The normal Torch backend is unchanged.
@@ -44,6 +49,19 @@ The existing `forward_prefetch` switch still controls explicit forward and
 backward prefetch targets. Turning it off does not change wrapping boundaries.
 Backward links follow reverse compute-stage order; this policy does not change
 Hyper's recomputation handling or the reduction waiting interval.
+
+For the patched Qwen3-MoE causal LM, an untied, bias-free standard output
+projection without pre-existing module hooks is also a separate FSDP unit.
+Its `FusedCrossEntropy` forward invokes the existing causal loss after the
+head's FSDP pre-forward hook has made the weight available. The original
+`lm_head.weight` parameter name and ordinary logits path are preserved.
+The head remains unsharded between its forward and backward so losses that
+save the weight for backward can safely read it. Tied, customized or hooked
+heads and heads of other models retain the root-managed behavior. When the
+embedding and output projection share parameters, both remain with the root.
+The embedding is not a backward prefetch target, since `inputs_embeds` may
+bypass it.
+This does not change the Torch FSDP2 path or enable fused communication.
 
 ## HyperParallel Muon
 
@@ -95,3 +113,17 @@ root drains outstanding reductions at backward completion. The default is
 Values above `1` require the Hyper backend and a HyperParallel version with
 this API. With Hyper communication fusion enabled, Hyper falls back to
 interval `1`. A larger interval retains more in-flight gradient buffers.
+## FP32 expert weight gradients
+
+For CUDA Qwen3 MoE with `moe_implementation: fused_triton`, `ep_size: 1`,
+BF16 compute parameters, and FP32 gradient reduction, set
+`model.accelerator.fsdp_config.hyper_expert_grad_dtype_fp32: true`. This is
+opt-in and requires both PyTorch `Tensor.grad_dtype` and a HyperParallel revision
+supporting `MixedPrecisionPolicy(grad_dtype_fn=...)`, such as the revision in
+[HyperParallel PR #1](https://github.com/Cui-yshoho/hyper-parallel/pull/1).
+The unsharded `gate_up_proj`
+and `down_proj` expert leaves then accept FP32 gradients. The merged Triton
+grouped GEMM accumulates BF16 products in FP32 and writes that accumulator
+directly into the FP32 gradient buffer, which can be used for ReduceScatter.
+Other parameters and the default configuration retain their existing behavior.
+The option does not support expert parallelism or LoRA.

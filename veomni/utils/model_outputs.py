@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 import torch
+from torch.utils._pytree import register_dataclass
 from transformers.modeling_outputs import CausalLMOutputWithPast, MoeCausalLMOutputWithPast, MoeModelOutputWithPast
 from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import Qwen2_5OmniThinkerCausalLMOutputWithPast
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLCausalLMOutputWithPast
@@ -105,6 +106,12 @@ class FusedLinearAuxOutput:
             student_mass=student_mass,
             teacher_mass=teacher_mass,
         )
+
+
+# FSDP discovers backward-hook targets by traversing the enclosing model
+# output as a pytree. Without this registration the nested auxiliary payload
+# is opaque and its differentiable tensors are skipped.
+register_dataclass(FusedLinearAuxOutput)
 
 
 @dataclass

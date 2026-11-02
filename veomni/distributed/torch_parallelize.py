@@ -1,4 +1,4 @@
-# Copyright 2025 Bytedance Ltd. and/or its affiliates
+# Copyright 2025-2026 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 import types
 from collections.abc import Collection, Mapping
 from functools import partial
+from inspect import Parameter, signature
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -44,6 +45,27 @@ from .utils import check_fqn_match, sort_fqn_by_submodule_first
 
 
 logger = logging.get_logger(__name__)
+
+
+def _optional_model_io_module(model: nn.Module, accessor_name: str) -> Optional[nn.Module]:
+    accessor = getattr(model, accessor_name, None)
+    if accessor is None:
+        return None
+    try:
+        module = accessor()
+    except NotImplementedError:
+        return None
+    return module if isinstance(module, nn.Module) else None
+
+
+def _validate_hyper_expert_grad_policy(policy_type) -> None:
+    parameters = signature(policy_type).parameters
+    if "grad_dtype_fn" not in parameters and not any(p.kind is Parameter.VAR_KEYWORD for p in parameters.values()):
+        raise RuntimeError(
+            "hyper_expert_grad_dtype_fp32 requires HyperParallel MixedPrecisionPolicy(grad_dtype_fn=...). "
+            "Install a compatible HyperParallel revision, such as the one from "
+            "https://github.com/Cui-yshoho/hyper-parallel/pull/1."
+        )
 
 
 def _reset_hf_initialized_flag(module: nn.Module) -> None:
@@ -462,11 +484,32 @@ def parallelize_model_fsdp2(
 
     use_hyper_fsdp2 = fsdp_backend == "hyper"
     reduce_comm_interval = kwargs.pop("hyper_reduce_comm_interval", 1)
+    expert_grad_dtype_fp32 = kwargs.pop("hyper_expert_grad_dtype_fp32", False)
     if type(reduce_comm_interval) is not int or reduce_comm_interval < 1:
         raise ValueError("hyper_reduce_comm_interval must be a positive integer.")
     if reduce_comm_interval != 1 and not use_hyper_fsdp2:
         raise ValueError("hyper_reduce_comm_interval > 1 requires fsdp_backend='hyper'.")
     parallel_state = get_parallel_state()
+    expert_grad_param_ids = set()
+    if expert_grad_dtype_fp32:
+        if not use_hyper_fsdp2 or parallel_state.ep_enabled:
+            raise ValueError("FP32 expert gradients require Hyper FSDP2 with ep_size=1.")
+        if not mixed_precision.enable or (
+            mixed_precision.param_dtype != "bfloat16" or mixed_precision.reduce_dtype != "float32"
+        ):
+            raise ValueError("FP32 expert gradients require BF16 parameters and FP32 gradient reduction.")
+        if get_device_type() != "cuda" or getattr(getattr(model, "config", None), "model_type", None) != "qwen3_moe":
+            raise ValueError("FP32 expert gradients currently support Qwen3 MoE on CUDA only.")
+        for module in model.modules():
+            if module.__class__.__name__ == "Qwen3MoeExperts":
+                for name in ("gate_up_proj", "down_proj"):
+                    param = getattr(module, name, None)
+                    if not isinstance(param, nn.Parameter) or param.ndim != 3:
+                        raise ValueError(f"Qwen3 MoE expert parameter {name} must be a 3D Parameter.")
+                    expert_grad_param_ids.add(id(param))
+        if not expert_grad_param_ids:
+            raise ValueError("FP32 expert gradients requested but no Qwen3 MoE expert parameters were found.")
+        logger.info_rank0(f"FP32 expert wgrad enabled for {len(expert_grad_param_ids)} parameters.")
     if use_hyper_fsdp2:
         from .hyper_fsdp2 import (
             extra_parallel_gradient_scaling_factor,
@@ -524,7 +567,10 @@ def parallelize_model_fsdp2(
     ]
     logger.info_rank0(f"target classes to shard: {target_classes}")
     submodule_wrap_targets = {}
-    if use_hyper_fsdp2:
+    output_dtype_is_set = mixed_precision.enable and getattr(mixed_precision, "output_dtype", None) is not None
+    has_frozen_parameters = use_hyper_fsdp2 and any(not param.requires_grad for param in model.parameters())
+    keep_cuda_output_boundaries = output_dtype_is_set and get_device_type() == "cuda"
+    if use_hyper_fsdp2 and (keep_cuda_output_boundaries or (not output_dtype_is_set and not has_frozen_parameters)):
         from .fsdp2.submodule_prefetch import resolve_submodule_wrap_targets
 
         submodule_wrap_targets = resolve_submodule_wrap_targets(
@@ -708,12 +754,16 @@ def parallelize_model_fsdp2(
         fsdp_kwargs["ignored_params"] = persistent_extra_parallel_params
     # prepare mp_policy kwargs
     if mixed_precision.enable:
-        mp_policy = mixed_precision_policy_type(
+        mp_kwargs = dict(
             param_dtype=getattr(torch, mixed_precision.param_dtype) if mixed_precision.param_dtype else None,
             reduce_dtype=getattr(torch, mixed_precision.reduce_dtype) if mixed_precision.reduce_dtype else None,
             output_dtype=getattr(torch, mixed_precision.output_dtype) if mixed_precision.output_dtype else None,
             cast_forward_inputs=mixed_precision.cast_forward_inputs,
         )
+        if expert_grad_dtype_fp32:
+            _validate_hyper_expert_grad_policy(mixed_precision_policy_type)
+            mp_kwargs["grad_dtype_fn"] = lambda param: torch.float32 if id(param) in expert_grad_param_ids else None
+        mp_policy = mixed_precision_policy_type(**mp_kwargs)
         fsdp_kwargs["mp_policy"] = mp_policy
     # prepare offload_policy kwargs
     enable_fsdp_cpu_offload = kwargs.pop("enable_fsdp_offload", False)
@@ -907,24 +957,58 @@ def parallelize_model_fsdp2(
         #      when layer_mod (also called as target module, e.g. decoder.embed_tokens),
         #      is the parent of or equal to extra_parallel_mod[para] (e.g. ToyEmbed),
         #      no need to shard layer_mod again.
-        if not isinstance(layer_mod, fsdp_module_type):
+        if (layer_mod not in submodule_wrap_targets or output_dtype_is_set) and not isinstance(
+            layer_mod, fsdp_module_type
+        ):
             apply_fully_shard(layer_mod, fsdp_kwargs)
             if transport_reduction_scales is not None and fsdp_transport_enabled:
                 transport_reduction_scales[layer_mod] = fsdp_reduction_scale
             layer_mod._fsdp_modules.append(layer_mod)
+            if layer_mod in submodule_wrap_targets:
+                # Preserve the original enclosing block's input/output casts.
+                submodule_prefetch_stages[layer_mod].insert(0, [layer_mod])
         logger.info_rank0(f"{layer_fqn=}, {layer_mod._fsdp_modules=}")
 
-    # Keep the root unsharded between forward and backward. PyTorch requires
+    if submodule_wrap_targets and not output_dtype_is_set:
+        input_embeddings = _optional_model_io_module(model, "get_input_embeddings")
+        output_head = _optional_model_io_module(model, "get_output_embeddings")
+        input_param_ids = (
+            {id(param) for param in input_embeddings.parameters()} if input_embeddings is not None else set()
+        )
+        shared_io_weights = output_head is not None and any(
+            id(param) in input_param_ids for param in output_head.parameters()
+        )
+        # A tied embedding and head must remain in the same FSDP unit: even if
+        # the head itself stays at the root, wrapping the embedding would claim
+        # the shared parameter before the root can manage it.
+        io_wrap_targets = [] if shared_io_weights or input_embeddings is None else [input_embeddings]
+        keep_full_head = (getattr(model, "_fsdp_plan", None) or {}).get("lm_head") == "keep_full_weight"
+        fused_head = None
+        if keep_full_head and output_head is not None and not shared_io_weights:
+            from ..ops.kernels.cross_entropy.fused_head import enable_qwen3_moe_fused_head
+
+            fused_head = enable_qwen3_moe_fused_head(model)
+        # Only a head that invokes the fused loss inside its own forward can
+        # safely use its FSDP hooks. A missing plan does not establish that:
+        # other patched models also access lm_head.weight directly.
+        if fused_head is not None:
+            io_wrap_targets.append(output_head)
+        for module in io_wrap_targets:
+            if not isinstance(module, fsdp_module_type):
+                options = fsdp_kwargs
+                if module is fused_head:
+                    # Some fused losses save the weight for backward. Preserve
+                    # its storage until the head's backward has completed.
+                    options = {**fsdp_kwargs, "reshard_after_forward": False}
+                apply_fully_shard(module, options)
+
+    # Keep the root's remaining parameters unsharded between forward and backward. PyTorch requires
     # omitting `reshard_after_forward` to trigger its root auto-no-reshard
     # behavior (`_fsdp_state.py:_lazy_init`), while Hyper requires an explicit
     # False because its omitted-value default is True.
-    # This keeps the root's params (lm_head + embeddings + final norm)
-    # unsharded between forward and backward, which is what fused-linear
-    # kernels (chunk_logprobs / chunk_topk_distill) need — they save the
-    # lm_head weight via `save_for_backward` and would otherwise hit
-    # `setStorage … storage of size 0` when the saved reference points
-    # to a freed buffer. Decoder layers reshard normally (their calls
-    # above pass `reshard_after_forward` explicitly).
+    # Split blocks leave their decoder norms here. Unsplit models also leave
+    # embeddings and lm_head here for fused-linear kernels that access weights
+    # directly instead of calling the corresponding module.
     root_fsdp_kwargs = _build_root_fsdp_kwargs(fsdp_kwargs, use_hyper_fsdp2)
     apply_fully_shard(model, root_fsdp_kwargs)
     if reduce_comm_interval != 1:
@@ -956,6 +1040,10 @@ def parallelize_model_fsdp2(
     need_manual_prefetch = (
         use_hyper_fsdp2 or parallel_state.any_extra_parallel_enabled or mp_ignored_classes is not None
     ) and kwargs.pop("enable_forward_prefetch", True)
+    if has_frozen_parameters:
+        # Frozen towers and heads may never run a backward hook to consume a
+        # prefetched AllGather. Their execution order is not statically known.
+        need_manual_prefetch = False
     if need_manual_prefetch and submodule_wrap_targets:
         from .fsdp2.submodule_prefetch import configure_submodule_prefetch
 
@@ -967,7 +1055,22 @@ def parallelize_model_fsdp2(
             else [list(reversed(block._fsdp_modules))]
             for _, block in target_modules
         ]
+        input_is_wrapped = (
+            not output_dtype_is_set and input_embeddings is not None and input_embeddings in io_wrap_targets
+        )
+        if not output_dtype_is_set and fused_head is not None:
+            block_stages.append([[fused_head]])
         configure_submodule_prefetch(block_stages)
+        if input_is_wrapped:
+            stages = [stage for block in block_stages for stage in block]
+            input_embeddings.set_modules_to_forward_prefetch([unit for stage in stages[:2] for unit in stage])
+            # inputs_embeds bypasses the embedding, so no backward stage may
+            # prefetch it: there may be no embedding backward hook to consume it.
+            input_embeddings.set_modules_to_backward_prefetch([])
+        if not output_dtype_is_set and fused_head is not None:
+            fused_head.set_modules_to_backward_prefetch(
+                [unit for stage in reversed(block_stages[-2]) for unit in stage]
+            )
         logger.info_rank0("[hyper-forward-prefetch] policy=stage depth=2")
         module_names = {id(module): name for name, module in model.named_modules()}
         logger.info_rank0(
