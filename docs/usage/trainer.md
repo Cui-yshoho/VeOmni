@@ -2,6 +2,82 @@
 
 This document details the Trainer system in VeOmni. While [Basic Modules](./basic_modules.md) introduces the individual components (Dataset, Model, Parallel State, etc.), the `BaseTrainer` orchestrates these components to execute the training loop, handle distributed training complexities, and manage the training lifecycle through callbacks.
 
+## Optional HyperParallel adapter
+
+Install a HyperParallel version providing `hyper_parallel.integration.veomni.apply_hyper_parallel_patch`,
+then enable it in the job configuration:
+
+```yaml
+model:
+  accelerator:
+    fsdp_config:
+      fsdp_mode: fsdp2
+      fsdp_backend: hyper_parallel
+      fsdp_scope: module
+      reshard_after_forward: true
+      reshard_after_backward: true
+      forward_prefetch: true
+      offload: false
+      offload_pin_memory: true
+      low_precision_reduce_scatter_comm: false
+      max_load_broadcast_size: 20.0
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+        output_dtype: null
+        cast_forward_inputs: true
+      hyper_parallel:
+        comm_fusion: false
+        comm_fusion_zero_copy: null
+        wrap_policy: block
+        forward_prefetch_depth: 2
+        reduce_comm_interval: 1
+  optimizer:
+    type: muon
+    use_hyper_optimizer: true
+```
+
+Keep the original task command:
+
+```bash
+torchrun --standalone --nproc_per_node=8 \
+  tasks/train_text.py config.yaml
+```
+
+For two nodes, run the same command on each node with its own `NODE_RANK`:
+
+```bash
+torchrun --nnodes=2 --nproc_per_node=8 --node_rank="$NODE_RANK" \
+  --master_addr="$MASTER_ADDR" --master_port="$MASTER_PORT" \
+  tasks/train_text.py config.yaml
+```
+
+Ordinary training tasks activate the adapter in `BaseTrainer._setup`; Omni uses
+the same opt-in in `OmniTrainer._setup`. Both run before model construction.
+HyperParallel owns execution compatibility. The selected task still constructs
+VeOmni's original Trainer and runtime, using its existing
+data, scheduler and checkpoint lifecycle. FSDP and Muon are independent choices:
+`fsdp_backend: hyper_parallel` selects Hyper FSDP/HSDP, while
+`use_hyper_optimizer: true` selects Hyper Muon and requires `type: muon`.
+Set either option back to its default (`torch` / `false`) to retain the native
+implementation for that component. Supported AdamW configurations retain native AdamW.
+
+Public FSDP fields remain shared. Hyper-specific controls live under
+`fsdp_config.hyper_parallel`: fusion controls are passed to native Hyper;
+`block` reuses VeOmni's wrap discovery and per-block managed units. Forward
+prefetch depth counts following blocks and is gated by `forward_prefetch`.
+`comm_fusion_zero_copy: null` retains Hyper's default; explicit `true` requires fusion.
+Non-default reduction intervals require Hyper's `set_reduce_comm_interval` API;
+an unavailable API raises an error. The native Torch low-precision RS hook is
+not enabled for Hyper; keep `low_precision_reduce_scatter_comm: false`.
+
+Defaults do not import or require HyperParallel on the native path.
+Adapter installation is process-wide;
+do not mix native and Hyper jobs in the same process. Supported models,
+parallel layouts and checkpoint options are governed by the installed adapter;
+the options do not imply that all task or modality combinations are supported.
+
 ## Base Trainer
 
 The [`BaseTrainer`](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/base.py) class is the foundation for all training tasks in VeOmni. It handles:

@@ -340,6 +340,14 @@ class BaseTrainer(Stateful, ABC):
         Everything here is job-level and runs before any model exists, so it
         takes the config rather than a built trainer.
         """
+        if (
+            args.model.accelerator.fsdp_config.fsdp_backend == "hyper_parallel"
+            or args.model.optimizer.use_hyper_optimizer
+        ):
+            from hyper_parallel.integration.veomni import apply_hyper_parallel_patch
+
+            apply_hyper_parallel_patch(args.model)
+
         # log args
         logger.info_rank0(json.dumps(asdict(args), indent=2))
 

@@ -217,6 +217,14 @@ class OmniTrainer:
         ``train.checkpoint.output_dir``; inference turns it off because it
         produces no training artefacts.
         """
+        if (
+            args.model.accelerator.fsdp_config.fsdp_backend == "hyper_parallel"
+            or args.model.optimizer.use_hyper_optimizer
+        ):
+            from hyper_parallel.integration.veomni import apply_hyper_parallel_patch
+
+            apply_hyper_parallel_patch(args.model)
+
         logger.info_rank0(json.dumps(asdict(args), indent=2))
 
         device_str = f"{get_device_type()}:{args.train.local_rank}"

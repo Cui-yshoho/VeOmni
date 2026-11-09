@@ -106,6 +106,14 @@ veomni/
 
 ## Trainer Hierarchy
 
+Optional HyperParallel integration is selected through
+`model.accelerator.fsdp_config.fsdp_backend: hyper_parallel` and independently
+`model.optimizer.use_hyper_optimizer: true`. `BaseTrainer._setup` and the
+independent `OmniTrainer._setup` lazily call the external
+`apply_hyper_parallel_patch(model_config)` before device and model initialization.
+Original task scripts and runtime construction stay unchanged. The bindings are
+process-wide; changing backend selection after model construction is unsupported.
+
 A training job splits in two. `VeOmniModelRuntime` (`veomni/models/model_runtime.py`) owns everything bound to *one* model; `BaseTrainer` *holds* one as `trainer.model` and adds everything bound to the *job*, of which there is exactly one. A single-model job is one runtime inside one trainer; a composed omni model is many runtimes under one orchestrator, which is why the trainer composes the runtime rather than inheriting it — `OmniTrainer` holds several and could not inherit them all.
 
 `trainer.model` is therefore the runtime, not the raw module. It forwards unshadowed `nn.Module` APIs (`.parameters()`, `.config`) via `__getattr__` and forwards `trainer.model(**batch)` via `__call__`, so most call sites read unchanged; the real `nn.Module` is at `trainer.model.model`. Code that needs a genuine module — anything doing `isinstance`, or handing it to `fully_shard` / DCP — must go through the runtime's own methods instead of unwrapping at the call site.

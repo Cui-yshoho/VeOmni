@@ -24,7 +24,11 @@ still needs the multi-rank suites. The seam tests below need no distribution
 at all.
 """
 
-from types import SimpleNamespace
+import sys
+from dataclasses import fields
+from importlib import import_module
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -51,6 +55,101 @@ from ..tools.training_utils import make_eager_ops_config, unbuilt_runtime
 
 
 TOY_CONFIG = "./tests/toy_config/qwen3_toy"
+
+
+@pytest.mark.parametrize("module_name", ["veomni.trainer.base", "veomni.trainer.omni.omni_trainer"])
+@pytest.mark.parametrize("fsdp,muon", [(False, False), (True, False), (False, True), (True, True)])
+def test_hyper_adapter_is_opt_in_before_job_initialization(monkeypatch, module_name, fsdp, muon):
+    module = import_module(module_name)
+    trainer = module.BaseTrainer if module_name.endswith("base") else module.OmniTrainer
+    adapter = ModuleType("hyper_parallel.integration.veomni")
+    adapter.apply_hyper_parallel_patch = Mock()
+    monkeypatch.setitem(sys.modules, adapter.__name__, adapter)
+    monkeypatch.setattr(module, "asdict", lambda _: {})
+    monkeypatch.setattr(module.logger, "info_rank0", Mock(side_effect=RuntimeError("stop before device setup")))
+    with pytest.raises(RuntimeError, match="stop before device setup"):
+        model = SimpleNamespace(
+            accelerator=SimpleNamespace(
+                fsdp_config=SimpleNamespace(fsdp_backend="hyper_parallel" if fsdp else "torch")
+            ),
+            optimizer=SimpleNamespace(use_hyper_optimizer=muon),
+        )
+        trainer._setup(SimpleNamespace(model=model))
+    assert adapter.apply_hyper_parallel_patch.call_count == int(fsdp or muon)
+    if fsdp or muon:
+        adapter.apply_hyper_parallel_patch.assert_called_once_with(model)
+
+
+@pytest.mark.parametrize("module_name", ["veomni.trainer.base", "veomni.trainer.omni.omni_trainer"])
+def test_hyper_activation_failure_does_not_fall_back_to_native(monkeypatch, module_name):
+    module = import_module(module_name)
+    trainer = module.BaseTrainer if module_name.endswith("base") else module.OmniTrainer
+    adapter = ModuleType("hyper_parallel.integration.veomni")
+    adapter.apply_hyper_parallel_patch = Mock(side_effect=ImportError("incompatible Hyper adapter"))
+    device = Mock()
+    monkeypatch.setitem(sys.modules, adapter.__name__, adapter)
+    monkeypatch.setattr(module, "get_torch_device", device)
+    with pytest.raises(ImportError, match="incompatible Hyper adapter"):
+        trainer._setup(
+            SimpleNamespace(
+                model=SimpleNamespace(
+                    accelerator=SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_backend="hyper_parallel")),
+                    optimizer=SimpleNamespace(use_hyper_optimizer=False),
+                )
+            )
+        )
+    device.assert_not_called()
+
+
+def test_hyper_selection_defaults_to_native():
+    from veomni.arguments import FSDPConfig, OptimizerConfig
+
+    assert next(field for field in fields(FSDPConfig) if field.name == "fsdp_backend").default == "torch"
+    assert next(field for field in fields(OptimizerConfig) if field.name == "use_hyper_optimizer").default is False
+
+
+def test_hyper_fsdp_nested_configuration_preserves_public_fields():
+    from veomni.arguments import FSDPConfig
+    from veomni.arguments.parser import _instantiate_recursive
+
+    config = _instantiate_recursive(
+        FSDPConfig,
+        {
+            "fsdp_backend": "hyper_parallel",
+            "reshard_after_backward": False,
+            "mixed_precision": {"param_dtype": "bfloat16", "reduce_dtype": "float32", "output_dtype": None},
+            "hyper_parallel": {
+                "comm_fusion": False,
+                "comm_fusion_zero_copy": None,
+                "wrap_policy": "block",
+                "forward_prefetch_depth": 2,
+                "reduce_comm_interval": 1,
+            },
+        },
+    )
+    assert config.fsdp_mode == "fsdp2"
+    assert config.reshard_after_backward is False
+    assert config.mixed_precision.output_dtype is None
+    assert config.hyper_parallel.forward_prefetch_depth == 2
+    assert config.hyper_parallel.reduce_comm_interval == 1
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"forward_prefetch_depth": 0},
+        {"forward_prefetch_depth": True},
+        {"reduce_comm_interval": -1},
+        {"comm_fusion": "false"},
+        {"comm_fusion_zero_copy": True},
+        {"wrap_policy": "unknown"},
+    ],
+)
+def test_hyper_fsdp_configuration_rejects_invalid_options(options):
+    from veomni.arguments.arguments_types import HyperParallelFSDPConfig
+
+    with pytest.raises(ValueError):
+        HyperParallelFSDPConfig(**options)
 
 
 def train_args(load_path=None):
