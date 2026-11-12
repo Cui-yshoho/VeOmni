@@ -32,6 +32,7 @@ model:
         comm_fusion_zero_copy: null
         wrap_policy: block
         forward_prefetch_depth: 2
+        backward_prefetch_depth: 1
         reduce_comm_interval: 1
   optimizer:
     type: muon

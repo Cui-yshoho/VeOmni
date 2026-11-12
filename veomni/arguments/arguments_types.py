@@ -549,6 +549,7 @@ class HyperParallelFSDPConfig:
     comm_fusion_zero_copy: Optional[bool] = None
     wrap_policy: Literal["block"] = "block"
     forward_prefetch_depth: int = 2
+    backward_prefetch_depth: int = 1
     reduce_comm_interval: int = 1
 
     def __post_init__(self):
@@ -560,7 +561,7 @@ class HyperParallelFSDPConfig:
             raise ValueError("comm_fusion_zero_copy=true requires comm_fusion=true.")
         if self.wrap_policy != "block":
             raise ValueError("Only hyper_parallel.wrap_policy='block' is currently supported.")
-        for name in ("forward_prefetch_depth", "reduce_comm_interval"):
+        for name in ("forward_prefetch_depth", "backward_prefetch_depth", "reduce_comm_interval"):
             value = getattr(self, name)
             if type(value) is not int or value < 1:
                 raise ValueError(f"hyper_parallel.{name} must be a positive integer.")

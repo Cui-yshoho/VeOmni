@@ -123,6 +123,7 @@ def test_hyper_fsdp_nested_configuration_preserves_public_fields():
                 "comm_fusion_zero_copy": None,
                 "wrap_policy": "block",
                 "forward_prefetch_depth": 2,
+                "backward_prefetch_depth": 2,
                 "reduce_comm_interval": 1,
             },
         },
@@ -131,6 +132,7 @@ def test_hyper_fsdp_nested_configuration_preserves_public_fields():
     assert config.reshard_after_backward is False
     assert config.mixed_precision.output_dtype is None
     assert config.hyper_parallel.forward_prefetch_depth == 2
+    assert config.hyper_parallel.backward_prefetch_depth == 2
     assert config.hyper_parallel.reduce_comm_interval == 1
 
 
@@ -139,6 +141,8 @@ def test_hyper_fsdp_nested_configuration_preserves_public_fields():
     [
         {"forward_prefetch_depth": 0},
         {"forward_prefetch_depth": True},
+        {"backward_prefetch_depth": 0},
+        {"backward_prefetch_depth": True},
         {"reduce_comm_interval": -1},
         {"comm_fusion": "false"},
         {"comm_fusion_zero_copy": True},
