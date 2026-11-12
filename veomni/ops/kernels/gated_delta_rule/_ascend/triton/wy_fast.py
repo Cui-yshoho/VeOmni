@@ -76,9 +76,9 @@ def prepare_wy_repr_bwd_kernel(
                 p_g = tl.make_block_ptr(g + offset, (T,), (1,), (i_t * BT,), (BT,), (0,))
                 p_A = tl.make_block_ptr(A + (bos * H + i_h) * BT, (BT, T), (1, H * BT), (0, i_t * BT), (BT, BT), (0, 1))
 
-                b_A = tl.load(p_A, boundary_check=(0, 1))
-                b_beta = tl.load(p_beta, boundary_check=(0,))
-                b_g = tl.load(p_g, boundary_check=(0,))
+                b_A = tl.load(p_A, boundary_check=(0, 1), padding_option="zero")
+                b_beta = tl.load(p_beta, boundary_check=(0,), padding_option="zero")
+                b_g = tl.load(p_g, boundary_check=(0,), padding_option="zero")
                 b_g_exp = tl.exp(b_g)
 
                 b_dbeta = tl.zeros([BT], dtype=tl.float32)
@@ -89,9 +89,9 @@ def prepare_wy_repr_bwd_kernel(
                     p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
                     p_dk = tl.make_block_ptr(dk + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
                     p_dw = tl.make_block_ptr(dw + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-                    b_k = tl.load(p_k, boundary_check=(0, 1))
+                    b_k = tl.load(p_k, boundary_check=(0, 1), padding_option="zero")
                     b_k_beta_g = (b_k * b_beta[:, None] * b_g_exp[:, None]).to(b_k.dtype)
-                    b_dw = tl.load(p_dw, boundary_check=(0, 1))
+                    b_dw = tl.load(p_dw, boundary_check=(0, 1), padding_option="zero")
                     b_dA += tl.dot(b_dw, tl.trans(b_k_beta_g))
                     b_dk_beta_g = tl.dot(b_A, b_dw)
                     b_dk = b_dk_beta_g * b_beta[:, None] * b_g_exp[:, None]
@@ -103,9 +103,9 @@ def prepare_wy_repr_bwd_kernel(
                     p_v = tl.make_block_ptr(v + (bos * H + i_h) * V, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
                     p_dv = tl.make_block_ptr(dv + (bos * H + i_h) * V, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
                     p_du = tl.make_block_ptr(du + (bos * H + i_h) * V, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-                    b_v = tl.load(p_v, boundary_check=(0, 1))
+                    b_v = tl.load(p_v, boundary_check=(0, 1), padding_option="zero")
                     b_v_beta = (b_v * b_beta[:, None]).to(b_v.dtype)
-                    b_du = tl.load(p_du, boundary_check=(0, 1))
+                    b_du = tl.load(p_du, boundary_check=(0, 1), padding_option="zero")
                     b_dA += tl.dot(b_du, tl.trans(b_v_beta))
                     b_dv_beta = tl.dot(b_A, b_du)
                     b_dv = b_dv_beta * b_beta[:, None]
@@ -122,8 +122,8 @@ def prepare_wy_repr_bwd_kernel(
                 for i_k in range(tl.cdiv(K, BK)):
                     p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
                     p_dk = tl.make_block_ptr(dk + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-                    b_k = tl.load(p_k, boundary_check=(0, 1))
-                    b_dk = tl.load(p_dk, boundary_check=(0, 1))
+                    b_k = tl.load(p_k, boundary_check=(0, 1), padding_option="zero")
+                    b_dk = tl.load(p_dk, boundary_check=(0, 1), padding_option="zero")
                     b_k_beta = (b_k * b_beta[:, None]).to(b_k.dtype)
                     b_A += tl.dot(b_k_beta, tl.trans(b_k))
                     b_dk_beta = tl.dot(b_dA, b_k)
@@ -132,7 +132,7 @@ def prepare_wy_repr_bwd_kernel(
                     b_dk += b_dk_beta * b_beta[:, None]
                     tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), boundary_check=(0, 1))
 
-                b_dA_A = b_dA * b_A
+                b_dA_A = tl.where(m_A, b_dA * b_A, 0.)
                 b_dg += tl.sum(b_dA_A, axis=1) - tl.sum(b_dA_A, axis=0)
                 p_dg = tl.make_block_ptr(dg + offset, (T,), (1,), (i_t * BT,), (BT,), (0,))
                 p_dbeta = tl.make_block_ptr(dbeta + offset, (T,), (1,), (i_t * BT,), (BT,), (0,))
@@ -200,33 +200,33 @@ def recompute_w_u_fwd_kernel(
                     offset = bos * H + i_h * T_max
 
                 p_beta = tl.make_block_ptr(beta + offset, (T,), (1,), (i_t * BT,), (BT,), (0,))
-                b_beta = tl.load(p_beta, boundary_check=(0,))
+                b_beta = tl.load(p_beta, boundary_check=(0,), padding_option="zero")
 
                 p_A = tl.make_block_ptr(A + (bos * H + i_h) * BT, (T, BT), (H * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
-                b_A = tl.load(p_A, boundary_check=(0, 1))
+                b_A = tl.load(p_A, boundary_check=(0, 1), padding_option="zero")
 
                 for i_v in range(tl.cdiv(V, BV)):
                     p_v = tl.make_block_ptr(v + (bos * H + i_h) * V, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
                     p_u = tl.make_block_ptr(u + (bos * H + i_h) * V, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-                    b_v = tl.load(p_v, boundary_check=(0, 1))
+                    b_v = tl.load(p_v, boundary_check=(0, 1), padding_option="zero")
                     b_vb = (b_v * b_beta[:, None]).to(b_v.dtype)
                     b_u = tl.dot(b_A, b_vb, allow_tf32=False)
                     tl.store(p_u, b_u.to(p_u.dtype.element_ty), boundary_check=(0, 1))
 
                 if USE_G:
                     p_g = tl.make_block_ptr(g + offset, (T,), (1,), (i_t * BT,), (BT,), (0,))
-                    b_g = tl.exp(tl.load(p_g, boundary_check=(0,)))
+                    b_g = tl.exp(tl.load(p_g, boundary_check=(0,), padding_option="zero"))
 
                 for i_k in range(tl.cdiv(K, BK)):
                     p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
                     p_w = tl.make_block_ptr(w + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-                    b_k = tl.load(p_k, boundary_check=(0, 1))
+                    b_k = tl.load(p_k, boundary_check=(0, 1), padding_option="zero")
                     b_kb = b_k * b_beta[:, None]
                     if USE_G:
                         b_kb *= b_g[:, None]
                     if USE_GK:
                         p_gk = tl.make_block_ptr(gk + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-                        b_kb *= tl.exp(tl.load(p_gk, boundary_check=(0, 1)))
+                        b_kb *= tl.exp(tl.load(p_gk, boundary_check=(0, 1), padding_option="zero"))
                     b_w = tl.dot(b_A, b_kb.to(b_k.dtype))
                     tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
 

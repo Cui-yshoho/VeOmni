@@ -68,32 +68,30 @@ def chunk_scaled_dot_kkt_fwd_kernel(
             A_batch_off = i_b * T_max * H * BT
 
             p_beta = tl.make_block_ptr(beta + beta_batch_off + bos + i_h * T_max, (T_local,), (1,), (i_t * BT,), (BT,), (0,))
-            b_beta = tl.load(p_beta, boundary_check=(0,))
+            b_beta = tl.load(p_beta, boundary_check=(0,), padding_option="zero")
 
             b_A = tl.zeros([BT, BT], dtype=tl.float32)
+            o_t = i_t * BT + tl.arange(0, BT)
+            T_mask = o_t < T_local
+            row_indices = tl.arange(0, BT)[:, None]
+            col_indices = tl.arange(0, BT)[None, :]
+            tril_mask = (row_indices > col_indices) & T_mask[:, None] & T_mask[None, :]
             for i_k in range(tl.cdiv(K, BK)):
                 p_k = tl.make_block_ptr(k + k_batch_off + (bos * H + i_h) * K, (T_local, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-                b_k = tl.load(p_k, boundary_check=(0, 1))
+                b_k = tl.load(p_k, boundary_check=(0, 1), padding_option="zero")
                 dot_product = tl.dot(b_k, tl.trans(b_k))
 
-                o_t = i_t * BT + tl.arange(0, BT)
-                o_t = o_t.to(tl.float32)
-                T_mask = (o_t < T_local).to(tl.float32)
-
-                row_indices = tl.arange(0, BT)[:, None]
-                col_indices = tl.arange(0, BT)[None, :]
-                tril_mask = (row_indices > col_indices).to(tl.float32)
-                tril_mask = tril_mask * T_mask[:, None]
-                masked_dot = dot_product * tril_mask
+                masked_dot = tl.where(tril_mask, dot_product, 0.)
                 b_A += masked_dot
 
             if USE_G:
                 p_g = tl.make_block_ptr(g + g_batch_off + bos + i_h * T_max, (T_local,), (1,), (i_t * BT,), (BT,), (0,))
-                b_g = tl.load(p_g, boundary_check=(0,))
+                b_g = tl.load(p_g, boundary_check=(0,), padding_option="zero")
                 b_g_diff = b_g[:, None] - b_g[None, :]
                 b_g_diff = tl.minimum(tl.maximum(b_g_diff, -50.0), 50.0)
                 b_A *= tl.exp(b_g_diff)
             b_A *= b_beta[:, None]
+            b_A = tl.where(tril_mask, b_A, 0.)
 
             p_A = tl.make_block_ptr(A + A_batch_off + (bos * H + i_h) * BT, (T_local, BT), (BT * H, 1), (i_t * BT, 0), (BT, BT), (1, 0))
             tl.store(p_A, b_A.to(p_A.dtype.element_ty), boundary_check=(0, 1))
@@ -146,7 +144,7 @@ def chunk_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
             A_ptr = A + (bos * H + i_h) * BT
 
             p_beta = tl.make_block_ptr(beta + bos * H + i_h, (T_val,), (H,), (i_t * BT + i_i * BC,), (BC,), (0,))
-            b_beta = tl.load(p_beta, boundary_check=(0,))
+            b_beta = tl.load(p_beta, boundary_check=(0,), padding_option="zero")
 
             b_A = tl.zeros([BC, BC], dtype=tl.float32)
             for i_k in range(tl.cdiv(K, BK)):
@@ -162,10 +160,10 @@ def chunk_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
                 o_k = i_k * BK + tl.arange(0, BK)
                 m_k = o_k < K
                 b_gn = tl.load(g_ptr + (i_t * BT + i_i * BC) * H * K + o_k, mask=m_k, other=0)
-                b_g = tl.load(p_g, boundary_check=(0, 1))
-                b_k = tl.load(p_k, boundary_check=(0, 1)) * tl.exp(b_g - b_gn[None, :])
-                b_gk = tl.load(p_gk, boundary_check=(0, 1))
-                b_kt = tl.load(b_kt, boundary_check=(0, 1)) * tl.exp(b_gn[:, None] - b_gk)
+                b_g = tl.load(p_g, boundary_check=(0, 1), padding_option="zero")
+                b_k = tl.load(p_k, boundary_check=(0, 1), padding_option="zero") * tl.exp(b_g - b_gn[None, :])
+                b_gk = tl.load(p_gk, boundary_check=(0, 1), padding_option="zero")
+                b_kt = tl.load(b_kt, boundary_check=(0, 1), padding_option="zero") * tl.exp(b_gn[:, None] - b_gk)
                 b_A += tl.dot(b_k, b_kt)
             b_A *= b_beta[:, None]
 
@@ -218,8 +216,8 @@ def chunk_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
                                     (1, 0))
             p_beta = beta + (bos + i_t * BT + i_i * BC + o_i) * H + i_h
 
-            b_k = tl.load(p_k, boundary_check=(0, 1)) * tl.load(p_beta, mask=m_A, other=0)[:, None]
-            b_g = tl.load(p_g, boundary_check=(0, 1))
+            b_k = tl.load(p_k, boundary_check=(0, 1), padding_option="zero") * tl.load(p_beta, mask=m_A, other=0)[:, None]
+            b_g = tl.load(p_g, boundary_check=(0, 1), padding_option="zero")
 
             p_kt = k + (bos + i_t * BT + i_i * BC) * H * K + i_h * K + o_k
             p_gk = g + (bos + i_t * BT + i_i * BC) * H * K + i_h * K + o_k
