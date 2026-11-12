@@ -18,6 +18,28 @@ def _load_text_model_class():
     return module.Qwen4ExpTextModel
 
 
+def test_qwen4_exp_empty_ple_lookup_preserves_values_and_zero_gradients(monkeypatch):
+    module = importlib.import_module(_load_text_model_class().__module__)
+    embedding = module.Qwen4ExpTextNGramEmbedding.__new__(module.Qwen4ExpTextNGramEmbedding)
+    torch.nn.Module.__init__(embedding)
+    embedding.ngram_embedding = torch.nn.ModuleDict({f"shard_{index}": torch.nn.Embedding(4, 8) for index in range(2)})
+    parameters = tuple(embedding.parameters())
+    original_index_copy = torch.Tensor.index_copy
+
+    def checked_index_copy(tensor, dim, index, source):
+        assert index.numel(), "Empty index_copy must not be invoked on the PLE path"
+        return original_index_copy(tensor, dim, index, source)
+
+    monkeypatch.setattr(torch.Tensor, "index_copy", checked_index_copy)
+    rows = torch.tensor([1, 2])
+    output = embedding._lookup_local_rows(torch.zeros_like(rows), rows)
+    torch.testing.assert_close(output, parameters[0][rows], rtol=0, atol=0)
+    output.square().sum().backward()
+    assert all(parameter.grad is not None for parameter in parameters)
+    assert torch.count_nonzero(parameters[1].grad) == 0
+    assert all(before is after for before, after in zip(parameters, embedding.parameters()))
+
+
 def _forward_varlen(model, input_ids: torch.Tensor, packed_seq_lens: tuple[int, ...]) -> torch.Tensor:
     text_positions = torch.cat([torch.arange(length) for length in packed_seq_lens]).view(1, -1)
     position_ids = text_positions.unsqueeze(0).expand(4, -1, -1)

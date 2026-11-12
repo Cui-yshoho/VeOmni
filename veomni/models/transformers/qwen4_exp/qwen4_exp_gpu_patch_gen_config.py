@@ -391,6 +391,8 @@ class PatchedQwen4ExpTextExperts(nn.Module):
 #    them, while retaining FP32 master parameters.
 # 6. Require explicit packed boundaries and reset n-gram history for every
 #    segment; recurrent-cache and non-varlen paths are intentionally unsupported.
+# 7. Preserve the output on empty table lookups without invoking index_copy;
+#    retain a zero-gradient dependency on every table.
 # ================================================================
 @config.add_helper
 class _Qwen4ExpScaleGradient(torch.autograd.Function):
@@ -500,7 +502,14 @@ class PatchedQwen4ExpTextNGramEmbedding(nn.Module):
             if hasattr(weight, "to_local"):
                 weight = weight.to_local()
             values = nn.functional.embedding(row_ids[positions], weight).to(output.dtype)
-            output = output.index_copy(0, positions, values)
+            # --- Patch.7 ---
+            if positions.numel():
+                output = output.index_copy(0, positions, values)
+            else:
+                # NPU index_copy with an empty index may return changed values.
+                # An empty sum is zero and keeps this table's zero gradient.
+                output = output + values.sum()
+            # --- Patch.7 ---
         return output
 
     def _distributed_lookup(
