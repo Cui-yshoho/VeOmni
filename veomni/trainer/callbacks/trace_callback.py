@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import struct
 import time
 from typing import TYPE_CHECKING, Any, Dict, List, Union
 
@@ -172,6 +173,9 @@ class ProfileTraceCallback(Callback):
                 with_stack=args.train.profile.with_stack,
                 with_modules=args.train.profile.with_modules,
                 global_rank=args.train.global_rank,
+                warmup_steps=args.train.profile.warmup_steps,
+                level=args.train.profile.level,
+                data_simplification=args.train.profile.data_simplification,
             )
             self.profiler.start()
 
@@ -293,6 +297,18 @@ class TqdmCallback(Callback):
         self.data_loader_tqdm.close()
 
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
-        postfix = ", ".join(f"{k.split('/', 1)[-1]}: {v:.2f}" for k, v in self.trainer.step_train_metrics.items())
-        self.data_loader_tqdm.set_postfix_str(postfix, refresh=False)
+        postfix = []
+        binary_metrics = []
+        for key, value in self.trainer.step_train_metrics.items():
+            name = key.split("/", 1)[-1]
+            precision = 20 if "loss" in name or name == "grad_norm" else 2
+            postfix.append(f"{name}: {value:.{precision}f}")
+            if name in {"total_loss", "grad_norm"}:
+                # Reduced metrics are Python floats; encode their binary64 representation.
+                bits = struct.unpack(">Q", struct.pack(">d", float(value)))[0]
+                binary_metrics.append(f"{name}={value:.20f} {name}_bits64={bits:064b}")
+        if binary_metrics:
+            # Keep full values outside tqdm's width-limited progress display.
+            logger.info_rank0("step=%d %s", state.global_step, " ".join(binary_metrics))
+        self.data_loader_tqdm.set_postfix_str(", ".join(postfix), refresh=False)
         self.data_loader_tqdm.update()

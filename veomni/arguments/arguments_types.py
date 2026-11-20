@@ -339,7 +339,21 @@ class ProfileConfig:
     )
     end_step: int = field(
         default=2,
-        metadata={"help": "End step for profiling."},
+        metadata={"help": "Exclusive end step for profiling."},
+    )
+    warmup_steps: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Profiler warmup steps immediately before start_step; None keeps the automatic 0/1-step warmup."
+        },
+    )
+    level: int = field(
+        default=1,
+        metadata={"help": "NPU profiler level (0, 1, or 2). Level 0 disables AI Core metrics for lower overhead."},
+    )
+    data_simplification: bool = field(
+        default=False,
+        metadata={"help": "Simplify NPU profiling output by removing intermediate files after analysis."},
     )
     trace_dir: str = field(
         default="./trace",

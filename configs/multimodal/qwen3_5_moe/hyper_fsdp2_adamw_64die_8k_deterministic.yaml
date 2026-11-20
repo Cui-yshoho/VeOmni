@@ -1,0 +1,65 @@
+model:
+  model_path: Qwen/Qwen3.5-35B-A3B
+  ops_implementation:
+    attn_implementation: flash_attention_2
+    rms_norm_implementation: torch_npu
+    rotary_pos_emb_implementation: torch_npu
+    cross_entropy_loss_implementation: chunk_loss
+    gated_mlp_implementation: eager
+    moe_implementation: fused_npu
+    rms_norm_gated_implementation: torch_npu
+    causal_conv1d_implementation: triton
+    chunk_gated_delta_rule_implementation: fla_npu
+    load_balancing_loss_implementation: eager
+  optimizer:
+    lr: 1.0e-5
+    lr_decay_style: cosine
+  accelerator:
+    gradient_checkpointing:
+      enable_reentrant: false
+    init_device: meta
+    dp_shard_size: 64
+    ulysses_size: 1
+    ep_size: 1
+    fsdp_config:
+      fsdp_mode: hyper_fsdp2
+  chat_template: qwen3vl
+
+data:
+  train_path: configs/multimodal/data/tulu_sharegpt4v_llavavideo_65536.yaml
+  data_type: conversation
+  max_seq_len: 8192
+  train_size: 26214400
+  mm_configs:
+    image_max_pixels: 602112 # 28 * 28 * 768
+    video_max_pixels: 602112 # 28 * 28 * 768
+    video_total_pixels: 5780275 # max_seq_len * 28^2 * 0.9, dynamic per-frame budget
+    max_frames: 16
+    fps: 2.0
+    use_audio_in_video: false
+  dataloader:
+    pin_memory: false
+
+train:
+  enable_full_determinism: true
+  wandb:
+    enable: false
+    project: VeOmni
+    name: qwen35_8k_benchmark-hyper_fsdp2_adamw_64die_8k_deterministic
+  freeze_vit: false
+  num_train_epochs: 1
+  pad_to_length: true
+  micro_batch_size: 1
+  global_batch_size: 64
+  max_steps: 50
+  profile:
+    enable: false
+    trace_dir: outputs/hyper_fsdp2_adamw_64die_8k_deterministic/profiling
+    start_step: 20
+    end_step: 21
+    record_shapes: true
+  checkpoint:
+    output_dir: outputs/hyper_fsdp2_adamw_64die_8k_deterministic
+    manager: dcp
+    save_epochs: 0
+    save_hf_weights: false
