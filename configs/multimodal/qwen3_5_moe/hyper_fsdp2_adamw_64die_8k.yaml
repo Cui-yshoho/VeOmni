@@ -1,0 +1,66 @@
+model:
+  model_path: Qwen/Qwen3.5-35B-A3B
+  ops_implementation:
+    attn_implementation: flash_attention_2
+    rms_norm_implementation: torch_npu
+    rotary_pos_emb_implementation: torch_npu
+    cross_entropy_loss_implementation: chunk_loss
+    gated_mlp_implementation: eager
+    moe_implementation: fused_npu
+    rms_norm_gated_implementation: torch_npu
+    causal_conv1d_implementation: triton
+    chunk_gated_delta_rule_implementation: fla_npu
+    load_balancing_loss_implementation: eager
+  optimizer:
+    lr: 1.0e-5
+    lr_decay_style: cosine
+  accelerator:
+    gradient_checkpointing:
+      enable_reentrant: false
+    init_device: meta
+    dp_shard_size: 64
+    ulysses_size: 1
+    ep_size: 1
+    fsdp_config:
+      fsdp_mode: hyper_fsdp2
+  chat_template: qwen3vl
+  processor_config:
+    size:
+      shortest_edge: 4096
+      longest_edge: 81920
+
+data:
+  train_path: path/to/qwen35_35b_a3b_8k_native_balanced
+  data_type: conversation
+  source_name: qwen_omni_offline_av
+  max_seq_len: 8192
+  train_size: 26214400
+  mm_configs:
+    image_min_pixels: 4096
+    image_max_pixels: 4096
+    video_min_pixels: 4096
+    video_max_pixels: 4096
+    min_frames: 20
+    max_frames: 20
+    frame_factor: 2
+    use_audio_in_video: false
+  dataloader:
+    num_workers: 0
+
+train:
+  wandb:
+    enable: false
+    project: VeOmni
+    name: qwen35_8k_benchmark-hyper_fsdp2_adamw_64die_8k
+  freeze_vit: false
+  num_train_epochs: 1
+  dyn_bsz: false
+  pad_to_length: false
+  micro_batch_size: 1
+  global_batch_size: 64
+  max_steps: 50
+  checkpoint:
+    output_dir: outputs/hyper_fsdp2_adamw_64die_8k
+    manager: dcp
+    save_epochs: 0
+    save_hf_weights: false
