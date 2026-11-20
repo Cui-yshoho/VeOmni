@@ -55,8 +55,14 @@ else
   additional_args="--rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT}"
 fi
 
+log_tee_args=(log.txt)
+if [[ -n "${LOG_FILE:-}" ]]; then
+  mkdir -p "$(dirname "$LOG_FILE")" || exit 1
+  log_tee_args=("$LOG_FILE")
+fi
+
 torchrun \
   --nnodes=$NNODES \
   --nproc-per-node=$NPROC_PER_NODE \
   --node-rank=$NODE_RANK \
-  $additional_args $@ 2>&1 | tee log.txt
+  $additional_args $@ 2>&1 | tee "${log_tee_args[@]}"

@@ -855,6 +855,9 @@ def create_profiler(
     with_stack: bool,
     with_modules: bool,
     global_rank: int,
+    warmup_steps: Optional[int] = None,
+    level: int = 1,
+    data_simplification: bool = False,
 ):
     """
     Creates a profiler to record the CPU and CUDA / MLU activities. Default export to trace.json.
@@ -869,7 +872,17 @@ def create_profiler(
         record_shapes (bool): Whether to record the shapes of the tensors.
         profile_memory (bool): Whether to profile the memory usage.
         with_stack (bool): Whether to include the stack trace.
+        warmup_steps (Optional[int]): Warmup steps immediately before start_step; None keeps the automatic default.
+        level (int): NPU collection level (0, 1, or 2). Level 0 disables AI Core metrics.
+        data_simplification (bool): Remove intermediate NPU profiling files after analysis.
     """
+    warmup = (0 if start_step == 1 else 1) if warmup_steps is None else warmup_steps
+    if not 0 <= warmup < start_step:
+        raise ValueError("Profiler warmup_steps must be non-negative and smaller than start_step.")
+    if end_step <= start_step:
+        raise ValueError("Profiler end_step must be greater than start_step (exclusive end).")
+    if level not in (0, 1, 2):
+        raise ValueError("NPU profiler level must be 0, 1, or 2.")
 
     def handler_fn(p):
         time = int(datetime.datetime.now().timestamp())
@@ -895,8 +908,9 @@ def create_profiler(
             p.export_chrome_trace(trace_file)
         logger.info(f"Profiling result saved at {trace_file}.")
 
-        get_torch_device().memory._dump_snapshot(gpu_memory_file)
-        logger.info(f"Profiling memory visualization saved at {gpu_memory_file}.")
+        if profile_memory:
+            get_torch_device().memory._dump_snapshot(gpu_memory_file)
+            logger.info(f"Profiling memory visualization saved at {gpu_memory_file}.")
 
         if trace_dir.startswith("hdfs://"):
             copy(trace_file, trace_dir)
@@ -926,9 +940,13 @@ def create_profiler(
             CACHE_DIR if trace_dir.startswith("hdfs://") else trace_dir
         )
         experimental_config = torch_npu.profiler._ExperimentalConfig(
-            aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
-            profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
-            data_simplification=False,
+            aic_metrics=(
+                torch_npu.profiler.AiCMetrics.AiCoreNone
+                if level == 0
+                else torch_npu.profiler.AiCMetrics.PipeUtilization
+            ),
+            profiler_level=getattr(torch_npu.profiler.ProfilerLevel, f"Level{level}"),
+            data_simplification=data_simplification,
         )
     elif IS_MLU_AVAILABLE:
         profiler_module = torch.profiler
@@ -939,7 +957,6 @@ def create_profiler(
         activities = [profiler_module.ProfilerActivity.CPU, profiler_module.ProfilerActivity.CUDA]
         experimental_config = None
 
-    warmup = 0 if start_step == 1 else 1
     wait = start_step - warmup - 1
     active = end_step - start_step
     logger.info(f"build profiler schedule - wait: {wait}, warmup: {warmup}, active: {active}.")

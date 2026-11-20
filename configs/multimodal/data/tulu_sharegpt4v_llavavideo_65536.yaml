@@ -1,0 +1,11 @@
+sources:
+- configs/multimodal/data/expanded_65536/images.jsonl
+- /share/cys/code/workspace/cache/huggingface/datasets/tulu-3-sft-mixture
+- configs/multimodal/data/expanded_65536/videos.jsonl
+names:
+- sharegpt4v_captioner_sft
+- tulu-3-sft-mixture
+- LLaVA-Video-178K
+schedule:
+- schedule_type: const
+  weights: [0.4, 0.2, 0.4]
